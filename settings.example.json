@@ -1,0 +1,16 @@
+{
+  "always_ask_person_categories": [
+    "Bills"
+  ],
+  "default_person": "",
+  "incoming_checking_kinds": {
+    "ach_credit": "income",
+    "deposit": "reimbursement",
+    "other_credit": "reimbursement",
+    "p2p": "reimbursement"
+  },
+  "other_people_categories": [],
+  "personless_categories": [
+    "Income"
+  ]
+}
