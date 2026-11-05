@@ -2,7 +2,11 @@
 
 This file is a short, manually updated history of each released version.
 
-## 1.0.0 — 2026-08-03
+## Unreleased
+
+- Split the application into focused modules without changing its saved data or terminal workflow.
+
+## 1.0.0 - 2026-08-03
 
 - Added importing for the tested Apple Card, Amex, Chase credit, Chase checking, and Discover CSV layouts.
 - Added duplicate-file detection and overlapping-transaction merging.

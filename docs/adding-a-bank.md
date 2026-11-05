@@ -2,7 +2,7 @@
 
 Bank CSV exports differ in headers, signs, date fields, and transaction-type names. Even two exports from the same company may differ by product or download page. Add a layout deliberately rather than trying to infer an unknown format.
 
-All provider integration points are currently in `spending_analyzer.py`.
+Provider headers and labels live in `spending_analyzer/constants.py`. Detection, cleanup, classification, and normalization live in `spending_analyzer/providers.py`.
 
 ## 1. Add the identifying headers
 
