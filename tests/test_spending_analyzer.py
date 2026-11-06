@@ -154,6 +154,65 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(len(list((self.root / "processed/duplicates").glob("*.csv"))), 1)
 
+    def test_failed_file_does_not_persist_partial_transactions(self):
+        existing_row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "EXISTING", "Amount": "10.00", "Category": "Shopping",
+        }
+        write_csv(
+            self.inbox / "initial.csv",
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [existing_row],
+        )
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        transaction_path = self.root / "data/transactions/2026.json"
+        before = json.loads(transaction_path.read_text())
+
+        failed_path = self.inbox / "failed.csv"
+        write_csv(
+            failed_path,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [
+                existing_row,
+                {
+                    "Trans. Date": "07/03/2026", "Post Date": "07/04/2026",
+                    "Description": "NEW ROW", "Amount": "12.00", "Category": "Shopping",
+                },
+                {
+                    "Trans. Date": "NOT A DATE", "Post Date": "07/05/2026",
+                    "Description": "BROKEN", "Amount": "9.00", "Category": "Shopping",
+                },
+            ],
+        )
+        with patch("sys.stderr"):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertEqual(json.loads(transaction_path.read_text()), before)
+        imports = json.loads((self.root / "data/imports.json").read_text())
+        self.assertEqual([item["original_filename"] for item in imports], ["initial.csv"])
+        self.assertTrue(failed_path.exists())
+
+    def test_archive_failure_does_not_commit_staged_transactions(self):
+        source_path = self.inbox / "discover.csv"
+        write_csv(
+            source_path,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+
+        with (
+            patch("spending_analyzer.application.shutil.move", side_effect=OSError("archive failed")),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertEqual(analyzer.load_year_shards(self.root / "data/transactions"), [])
+        self.assertEqual(json.loads((self.root / "data/imports.json").read_text()), [])
+        self.assertTrue(source_path.exists())
+
     def test_rule_application_does_not_use_bank_category(self):
         transaction = {
             "id": "one", "provider": "apple", "account": "apple", "identifier": "CAFE", "kind": "expense"

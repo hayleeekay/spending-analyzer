@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import sys
+from typing import Any
 
 from .categorization import (
     apply_rules_and_decisions,
@@ -99,7 +100,6 @@ def process(root: Path, non_interactive: bool) -> int:
         print("Using the existing transaction history; skipped categories can still be completed.")
 
     imported_files = duplicate_files = failed_files = new_transactions = repeated_transactions = 0
-    affected_months: set[str] = set()
     for path in csv_paths:
         file_hash = sha256_file(path)
         if file_hash in known_files:
@@ -113,6 +113,8 @@ def process(root: Path, non_interactive: bool) -> int:
             account = account_id(provider, path.name)
             occurrence: Counter[str] = Counter()
             file_new = file_repeated = 0
+            file_new_transactions: dict[str, dict[str, Any]] = {}
+            repeated_transaction_ids: list[str] = []
             dates: list[str] = []
             for row in rows:
                 transaction = normalize_row(provider, account, row, path.name, settings)
@@ -121,21 +123,17 @@ def process(root: Path, non_interactive: bool) -> int:
                 transaction_id = stable_hash(base, occurrence[base])
                 transaction["id"] = transaction_id
                 dates.append(transaction["date"])
-                affected_months.add(transaction["date"][:7])
                 if transaction_id in existing:
-                    sources = existing[transaction_id].setdefault("source_files", [])
-                    if path.name not in sources:
-                        sources.append(path.name)
+                    repeated_transaction_ids.append(transaction_id)
                     file_repeated += 1
                 else:
-                    existing[transaction_id] = transaction
+                    file_new_transactions[transaction_id] = transaction
                     file_new += 1
             start = min(dates) if dates else "empty"
             end = max(dates) if dates else "empty"
             archive_name = f"{account}_{start}_to_{end}_{file_hash[:8]}.csv"
             destination = unique_destination(processed / account, archive_name)
-            shutil.move(str(path), destination)
-            imports.append({
+            import_record = {
                 "sha256": file_hash,
                 "original_filename": path.name,
                 "archived_path": str(destination.relative_to(root)),
@@ -146,7 +144,14 @@ def process(root: Path, non_interactive: bool) -> int:
                 "new_transactions": file_new,
                 "repeated_transactions": file_repeated,
                 "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            })
+            }
+            shutil.move(str(path), destination)
+            for transaction_id in repeated_transaction_ids:
+                sources = existing[transaction_id].setdefault("source_files", [])
+                if path.name not in sources:
+                    sources.append(path.name)
+            existing.update(file_new_transactions)
+            imports.append(import_record)
             known_files.add(file_hash)
             imported_files += 1
             new_transactions += file_new
