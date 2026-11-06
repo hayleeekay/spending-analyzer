@@ -38,14 +38,25 @@ from .storage import (
     stable_hash,
 )
 
-def process(root: Path, non_interactive: bool, *, profile_name: str | None = None) -> int:
-    inbox = root / "inbox"
-    processed = root / "processed"
+def process(
+    root: Path,
+    non_interactive: bool,
+    *,
+    profile_name: str | None = None,
+    external_import_source: Path | None = None,
+) -> int:
+    imports_dir = root / "imports"
+    archive_dir = root / "archive"
     data_dir = root / "data"
     rules_dir = root / "rules"
     reports_dir = root / "reports"
-    for directory in (inbox, processed, data_dir, rules_dir, reports_dir):
+    for directory in (imports_dir, archive_dir, data_dir, rules_dir, reports_dir):
         directory.mkdir(parents=True, exist_ok=True)
+
+    if profile_name:
+        print(f"Profile: {profile_name}")
+    print(f"Profile folder: {root}")
+    print(f"Import folder: {imports_dir}")
 
     import_path = data_dir / "imports.json"
     rule_path = rules_dir / "rules.json"
@@ -58,6 +69,30 @@ def process(root: Path, non_interactive: bool, *, profile_name: str | None = Non
     for transaction in transactions:
         transaction["identifier"] = clean_identifier_value(transaction["provider"], transaction["identifier"])
     imports = load_json(import_path, [])
+    known_files = {item["sha256"] for item in imports}
+    if external_import_source:
+        pending_hashes = {
+            sha256_file(path)
+            for path in imports_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".csv"
+        }
+        copied = already_seen = 0
+        for source in sorted(external_import_source.iterdir()):
+            if not source.is_file() or source.suffix.lower() != ".csv":
+                continue
+            source_hash = sha256_file(source)
+            if source_hash in known_files or source_hash in pending_hashes:
+                already_seen += 1
+                continue
+            destination = unique_destination(imports_dir, source.name)
+            shutil.copy2(source, destination)
+            if sha256_file(destination) != source_hash:
+                destination.unlink(missing_ok=True)
+                raise OSError(f"External CSV changed while it was being copied: {source}")
+            pending_hashes.add(source_hash)
+            copied += 1
+        print(f"External import source: {external_import_source} (read-only)")
+        print(f"External CSVs: {copied} copied, {already_seen} already known")
     decisions = load_decision_shards(decision_dir)
     rules = load_json(rule_path, [])
     categories = load_json(category_path, list(CATEGORIES))
@@ -89,20 +124,26 @@ def process(root: Path, non_interactive: bool, *, profile_name: str | None = Non
         if person and person.casefold() not in known_people:
             people.append(person)
             known_people.add(person.casefold())
-    if profile_name:
-        rule_count = f"{len(rules)} {'rule' if len(rules) == 1 else 'rules'}"
-        category_count = f"{len(categories)} {'category' if len(categories) == 1 else 'categories'}"
-        people_count = f"{len(people)} {'person' if len(people) == 1 else 'people'}"
-        print(f"Profile: {profile_name}")
-        print(f"Folder: {root}")
-        print(f"Setup: {rule_count}, {category_count}, {people_count}")
-    known_files = {item["sha256"] for item in imports}
+    rule_count = f"{len(rules)} {'rule' if len(rules) == 1 else 'rules'}"
+    category_count = f"{len(categories)} {'category' if len(categories) == 1 else 'categories'}"
+    people_count = f"{len(people)} {'person' if len(people) == 1 else 'people'}"
+    print(f"Setup: {rule_count}, {category_count}, {people_count}")
     existing = {transaction["id"]: transaction for transaction in transactions}
-    csv_paths = sorted(path for path in inbox.iterdir() if path.is_file() and path.suffix.lower() == ".csv")
+    misplaced_csvs = sorted(path.name for path in root.iterdir() if path.is_file() and path.suffix.lower() == ".csv")
+    if misplaced_csvs:
+        print(
+            f"WARNING: {len(misplaced_csvs)} CSV file(s) in the workspace root were not imported.\n"
+            f"Move them to the Import folder: {imports_dir}",
+            file=sys.stderr,
+        )
+    csv_paths = sorted(
+        path for path in imports_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".csv"
+    )
     if not csv_paths:
-        print(f"No CSV files found in {inbox}")
+        print("No new CSV files found.")
         if not transactions:
-            print("Drop bank exports there and run this command again.")
+            print(f"Next: add bank CSV exports to {imports_dir} and run this command again.")
             return 0
         print("Using the existing transaction history; skipped categories can still be completed.")
 
@@ -110,7 +151,7 @@ def process(root: Path, non_interactive: bool, *, profile_name: str | None = Non
     for path in csv_paths:
         file_hash = sha256_file(path)
         if file_hash in known_files:
-            destination = unique_destination(processed / "duplicates", path.name)
+            destination = unique_destination(archive_dir / "duplicates", path.name)
             shutil.move(str(path), destination)
             print(f"Duplicate file archived without reimporting: {path.name}")
             duplicate_files += 1
@@ -139,7 +180,7 @@ def process(root: Path, non_interactive: bool, *, profile_name: str | None = Non
             start = min(dates) if dates else "empty"
             end = max(dates) if dates else "empty"
             archive_name = f"{account}_{start}_to_{end}_{file_hash[:8]}.csv"
-            destination = unique_destination(processed / account, archive_name)
+            destination = unique_destination(archive_dir / account, archive_name)
             import_record = {
                 "sha256": file_hash,
                 "original_filename": path.name,
@@ -255,7 +296,7 @@ def process(root: Path, non_interactive: bool, *, profile_name: str | None = Non
     print("\nProcessing complete")
     print(f"  Files imported: {imported_files}")
     print(f"  Duplicate files skipped: {duplicate_files}")
-    print(f"  Files with errors (left in inbox): {failed_files}")
+    print(f"  Files with errors (left in Import folder): {failed_files}")
     print(f"  New transactions: {new_transactions}")
     print(f"  Repeated transaction rows merged: {repeated_transactions}")
     print(f"  Transactions categorized this run: {categorized}")

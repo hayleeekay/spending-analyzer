@@ -13,4 +13,4 @@ fi
 
 PYTHONPATH="$project_dir${PYTHONPATH:+:$PYTHONPATH}" \
 exec "$project_dir/.venv/bin/python" -m spending_analyzer \
-    --data-dir "$project_dir/spending-data" "$@"
+    --storage-dir "$project_dir/spending-data" "$@"
