@@ -1,6 +1,8 @@
 import csv
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +43,42 @@ class SpendingAnalyzerTest(unittest.TestCase):
     def test_unknown_csv_layout_explains_tested_formats(self):
         with self.assertRaisesRegex(ValueError, "Unrecognized CSV layout.*Chase credit requires"):
             analyzer.detect_provider(["Date", "Merchant Name", "Value"])
+
+    def test_launcher_resolves_data_paths_from_the_calling_directory(self):
+        temporary_root = Path(self.temporary.name)
+        project = temporary_root / "project"
+        caller = temporary_root / "caller"
+        source_root = Path(__file__).resolve().parents[1]
+        shutil.copytree(source_root / "spending_analyzer", project / "spending_analyzer")
+        shutil.copy2(source_root / "run.sh", project / "run.sh")
+        python = project / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(sys.executable)
+        caller.mkdir()
+
+        def run_launcher(*arguments: str) -> None:
+            subprocess.run(
+                [project / "run.sh", *arguments, "--non-interactive"],
+                cwd=caller,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        run_launcher("--data-dir", "./relative-data")
+        self.assertTrue((caller / "relative-data/inbox").is_dir())
+        self.assertFalse((project / "relative-data").exists())
+
+        run_launcher("--data-dir=./equals-data")
+        self.assertTrue((caller / "equals-data/inbox").is_dir())
+        self.assertFalse((project / "equals-data").exists())
+
+        absolute_data = temporary_root / "absolute-data"
+        run_launcher("--data-dir", str(absolute_data))
+        self.assertTrue((absolute_data / "inbox").is_dir())
+
+        run_launcher()
+        self.assertTrue((project / "spending-data/inbox").is_dir())
 
     def test_all_providers_year_sharding_and_duplicate_file(self):
         write_csv(self.inbox / "apple.csv", list(analyzer.PROVIDER_HEADERS["apple"]), [
