@@ -76,6 +76,37 @@ To show the installed version:
 ./run.sh --version
 ```
 
+## Separate profiles
+
+Use a profile when finances and custom rules should remain completely separate. For example:
+
+```bash
+./run.sh --profile alex
+./run.sh --profile jordan
+```
+
+Each profile is a complete workspace under `spending-data/`:
+
+```text
+spending-data/
+├── alex/
+│   ├── inbox/
+│   ├── processed/
+│   ├── data/
+│   ├── rules/
+│   └── reports/
+└── jordan/
+    ├── inbox/
+    ├── processed/
+    ├── data/
+    ├── rules/
+    └── reports/
+```
+
+Rules, categories, saved people, decisions, transactions, and reports never cross profile folders. Profile names use letters, numbers, hyphens, or underscores and are normalized to lowercase.
+
+Running without `--profile` keeps using the original `spending-data/` layout. Existing data is never moved automatically. With a custom base directory, `--data-dir /some/base --profile alex` uses `/some/base/alex`.
+
 ## Categorization workflow
 
 For an unfamiliar expense or refund, the program shows the date, description, account, and amount. You can:
@@ -119,7 +150,7 @@ The default Chase-checking policy treats:
 - ACH credits as income; and
 - other incoming credits as estimated reimbursements.
 
-These assumptions affect newly imported checking transactions and are configurable in `spending-data/rules/settings.json`. Copy the shape from [settings.example.json](settings.example.json). Each incoming type accepts `income` or `reimbursement`.
+These assumptions affect newly imported checking transactions and are configurable in `spending-data/rules/settings.json`, or the corresponding `rules/settings.json` inside a profile. Copy the shape from [settings.example.json](settings.example.json). Each incoming type accepts `income` or `reimbursement`.
 
 ## Local data and privacy
 
@@ -167,6 +198,7 @@ The tests use temporary directories and fictional CSV rows. They do not touch `s
 - Provider export formats can change; a changed header or transaction type may require an adapter update.
 - Incoming P2P payments and deposits are estimates until the user changes the configured policy.
 - Merchant matching is deterministic text matching, not fuzzy matching or machine learning.
+- Profiles isolate separate financial workspaces, but multiple same-provider accounts inside one profile may still need explicit account support.
 - v1 targets macOS. The Python code is portable, but a Windows launcher is not included yet.
 
 ## License

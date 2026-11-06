@@ -44,7 +44,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unrecognized CSV layout.*Chase credit requires"):
             analyzer.detect_provider(["Date", "Merchant Name", "Value"])
 
-    def test_launcher_resolves_data_paths_from_the_calling_directory(self):
+    def test_launcher_resolves_data_paths_and_profiles(self):
         temporary_root = Path(self.temporary.name)
         project = temporary_root / "project"
         caller = temporary_root / "caller"
@@ -56,11 +56,11 @@ class SpendingAnalyzerTest(unittest.TestCase):
         python.symlink_to(sys.executable)
         caller.mkdir()
 
-        def run_launcher(*arguments: str) -> None:
-            subprocess.run(
+        def run_launcher(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
                 [project / "run.sh", *arguments, "--non-interactive"],
                 cwd=caller,
-                check=True,
+                check=check,
                 capture_output=True,
                 text=True,
             )
@@ -76,6 +76,57 @@ class SpendingAnalyzerTest(unittest.TestCase):
         absolute_data = temporary_root / "absolute-data"
         run_launcher("--data-dir", str(absolute_data))
         self.assertTrue((absolute_data / "inbox").is_dir())
+
+        profile_result = run_launcher("--profile", "Alex")
+        alex_profile = project / "spending-data/alex"
+        self.assertTrue((alex_profile / "inbox").is_dir())
+        self.assertIn("Profile: alex", profile_result.stdout)
+        self.assertIn("Setup: 0 rules, 12 categories, 0 people", profile_result.stdout)
+
+        analyzer.save_json(alex_profile / "rules/rules.json", [{
+            "provider": "discover", "account": "discover", "pattern": "FICTIONAL",
+            "match_type": "exact", "category": "Other", "reviewed": True,
+        }])
+        profile_result = run_launcher("--profile", "alex")
+        self.assertIn("Setup: 1 rule, 12 categories, 0 people", profile_result.stdout)
+        jordan_result = run_launcher("--profile", "jordan")
+        self.assertIn("Setup: 0 rules, 12 categories, 0 people", jordan_result.stdout)
+        self.assertFalse((project / "spending-data/jordan/rules/rules.json").exists())
+
+        fictional_row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "FICTIONAL", "Amount": "10.00", "Category": "Shopping",
+        }
+        for profile in ("alex", "jordan"):
+            write_csv(
+                project / f"spending-data/{profile}/inbox/discover.csv",
+                list(analyzer.PROVIDER_HEADERS["discover"]),
+                [fictional_row],
+            )
+            run_launcher("--profile", profile)
+        alex_transactions = json.loads(
+            (project / "spending-data/alex/data/transactions/2026.json").read_text()
+        )
+        jordan_transactions = json.loads(
+            (project / "spending-data/jordan/data/transactions/2026.json").read_text()
+        )
+        self.assertEqual(alex_transactions[0]["category"], "Other")
+        self.assertEqual(jordan_transactions[0]["category"], "Uncategorized")
+
+        custom_profile = run_launcher("--data-dir", str(absolute_data), "--profile", "alex")
+        self.assertTrue((absolute_data / "alex/inbox").is_dir())
+        self.assertIn(f"Folder: {(absolute_data / 'alex').resolve()}", custom_profile.stdout)
+
+        relative_profile = run_launcher("--data-dir", "./profile-base", "--profile", "alex")
+        self.assertTrue((caller / "profile-base/alex/inbox").is_dir())
+        self.assertIn(f"Folder: {(caller / 'profile-base/alex').resolve()}", relative_profile.stdout)
+
+        unsafe = run_launcher("--profile", "../outside", check=False)
+        self.assertEqual(unsafe.returncode, 2)
+        self.assertFalse((project / "outside").exists())
+        reserved = run_launcher("--profile", "rules", check=False)
+        self.assertEqual(reserved.returncode, 2)
+        self.assertIn("reserved", reserved.stderr)
 
         run_launcher()
         self.assertTrue((project / "spending-data/inbox").is_dir())

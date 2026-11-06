@@ -38,7 +38,7 @@ from .storage import (
     stable_hash,
 )
 
-def process(root: Path, non_interactive: bool) -> int:
+def process(root: Path, non_interactive: bool, *, profile_name: str | None = None) -> int:
     inbox = root / "inbox"
     processed = root / "processed"
     data_dir = root / "data"
@@ -89,6 +89,13 @@ def process(root: Path, non_interactive: bool) -> int:
         if person and person.casefold() not in known_people:
             people.append(person)
             known_people.add(person.casefold())
+    if profile_name:
+        rule_count = f"{len(rules)} {'rule' if len(rules) == 1 else 'rules'}"
+        category_count = f"{len(categories)} {'category' if len(categories) == 1 else 'categories'}"
+        people_count = f"{len(people)} {'person' if len(people) == 1 else 'people'}"
+        print(f"Profile: {profile_name}")
+        print(f"Folder: {root}")
+        print(f"Setup: {rule_count}, {category_count}, {people_count}")
     known_files = {item["sha256"] for item in imports}
     existing = {transaction["id"]: transaction for transaction in transactions}
     csv_paths = sorted(path for path in inbox.iterdir() if path.is_file() and path.suffix.lower() == ".csv")
