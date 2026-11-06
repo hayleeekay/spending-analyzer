@@ -103,7 +103,7 @@ spending-data/
     └── reports/
 ```
 
-Rules, categories, saved people, decisions, transactions, and reports never cross profile folders. Profile names use letters, numbers, hyphens, or underscores and are normalized to lowercase.
+Rules, categories, saved people, decisions, transactions, and reports stay inside their profile folders. Profile names start with a letter or number, use only letters, numbers, hyphens, or underscores, and are normalized to lowercase. The internal names `data`, `inbox`, `processed`, `profiles`, `reports`, and `rules` are reserved. Profile folders cannot be symbolic links to other locations.
 
 Running without `--profile` keeps using the original `spending-data/` layout. Existing data is never moved automatically. With a custom base directory, `--data-dir /some/base --profile alex` uses `/some/base/alex`.
 
@@ -163,6 +163,8 @@ All user data lives under `spending-data/`, including:
 - generated reports.
 
 That directory is excluded by `.gitignore`. The repository contains no real transactions, names, account numbers, or personal rules. Keep `spending-data/` ignored when publishing a fork.
+
+If `--data-dir` points somewhere else inside a Git repository, that custom folder is not automatically ignored. Add it to that repository's `.gitignore` before importing financial data.
 
 JSON state is divided into yearly files, so the program does not rewrite one unlimited all-time file. No database server is required.
 

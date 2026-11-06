@@ -1,5 +1,6 @@
 import csv
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -53,7 +54,11 @@ class SpendingAnalyzerTest(unittest.TestCase):
         shutil.copy2(source_root / "run.sh", project / "run.sh")
         python = project / ".venv/bin/python"
         python.parent.mkdir(parents=True)
-        python.symlink_to(sys.executable)
+        python.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o755)
         caller.mkdir()
 
         def run_launcher(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -112,6 +117,17 @@ class SpendingAnalyzerTest(unittest.TestCase):
         )
         self.assertEqual(alex_transactions[0]["category"], "Other")
         self.assertEqual(jordan_transactions[0]["category"], "Uncategorized")
+
+        alias_profile = project / "spending-data/alias"
+        alias_profile.symlink_to(project / "spending-data/jordan", target_is_directory=True)
+        jordan_before = (project / "spending-data/jordan/data/transactions/2026.json").read_text()
+        alias_result = run_launcher("--profile", "alias", check=False)
+        self.assertEqual(alias_result.returncode, 1)
+        self.assertIn("cannot be a symbolic link", alias_result.stderr)
+        self.assertEqual(
+            (project / "spending-data/jordan/data/transactions/2026.json").read_text(),
+            jordan_before,
+        )
 
         custom_profile = run_launcher("--data-dir", str(absolute_data), "--profile", "alex")
         self.assertTrue((absolute_data / "alex/inbox").is_dir())

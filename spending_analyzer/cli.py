@@ -43,7 +43,10 @@ def main() -> int:
     try:
         data_dir = args.data_dir.expanduser()
         if args.profile:
-            data_dir /= args.profile
+            profile_dir = data_dir / args.profile
+            if profile_dir.is_symlink():
+                raise ValueError(f"Profile folder cannot be a symbolic link: {profile_dir}")
+            data_dir = profile_dir
         return process(data_dir.resolve(), args.non_interactive, profile_name=args.profile)
     except (KeyboardInterrupt, EOFError):
         print("\nStopped. Files already archived were imported safely; run again to continue.", file=sys.stderr)
