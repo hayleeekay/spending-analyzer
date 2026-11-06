@@ -5,6 +5,7 @@ This file is a short, manually updated history of each released version.
 ## Unreleased
 
 - Split the application into focused modules without changing its saved data or terminal workflow.
+- Prevent Excel reports from interpreting imported text as formulas.
 
 ## 1.0.0 - 2026-08-03
 

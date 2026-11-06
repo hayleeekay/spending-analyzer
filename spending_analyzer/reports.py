@@ -14,6 +14,18 @@ from .constants import PROVIDER_LABELS
 from .providers import account_label
 from .storage import money
 
+
+def _preserve_excel_text(workbook: Any) -> None:
+    """Keep report text beginning with '=' from becoming a formula."""
+    # Report totals are calculated in Python, so worksheet formula cells are
+    # always imported or user-entered text that openpyxl inferred incorrectly.
+    for worksheet in workbook.worksheets:
+        for row in worksheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f":
+                    cell.data_type = "s"
+
+
 def inflow_amount(transaction: dict[str, Any]) -> Decimal:
     return abs(money(transaction["raw_amount"])) if transaction["kind"] in {"income", "reimbursement"} else Decimal("0")
 
@@ -560,6 +572,7 @@ def generate_xlsx(
             f"I2:I{sheet.max_row}", CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=green))
         )
 
+    _preserve_excel_text(workbook)
     workbook.save(destination)
 
 
