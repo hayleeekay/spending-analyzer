@@ -16,7 +16,7 @@ Version 1 has been tested with the consumer export layouts used by:
 
 This does not guarantee that every account or export offered by those companies has the same layout. Formats may differ by product, country, download page, or future bank update. The importer checks for specific required headers; column order does not matter and extra columns are fine, but missing or renamed required columns are rejected instead of guessed.
 
-The tested header sets are listed in `PROVIDER_HEADERS` near the top of `spending_analyzer.py`. An unrecognized file stays in the inbox and the terminal prints both the received headers and the layouts it knows. See [Adding a bank](docs/adding-a-bank.md) to support another variation.
+The tested header sets are listed in `spending_analyzer/constants.py`. An unrecognized file stays in the inbox and the terminal prints both the received headers and the layouts it knows. See [Adding a bank](docs/adding-a-bank.md) to support another variation.
 
 ## What it produces
 
@@ -43,7 +43,7 @@ Card payments and recognized internal transfers remain visible in Transactions b
 Python 3.11 or newer is recommended.
 
 ```bash
-git clone YOUR_REPOSITORY_URL
+git clone https://github.com/hayleeekay/spending-analyzer.git
 cd spending-analyzer
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
@@ -100,7 +100,7 @@ Provider-supplied categories are retained only for reference. They never determi
 
 ## People and groups
 
-The first interactive run asks for a default person. A normal category selection assigns spending to that person. Add `P` to a category number—for example, `5p`—to choose another saved person.
+The first interactive run asks for a default person. A normal category selection assigns spending to that person. Add `P` to a category number, for example `5p`, to choose another saved person.
 
 Some categories can be configured to:
 
@@ -138,15 +138,20 @@ JSON state is divided into yearly files, so the program does not rewrite one unl
 ## Project layout
 
 ```text
-spending_analyzer.py     Application, provider adapters, rules, and reports
-run.sh                   macOS launcher
-requirements.txt         Runtime dependency versions
-settings.example.json    Documented configuration shape
-tests/                   Automated tests with fictional transactions
-docs/adding-a-bank.md    Provider-extension guide
+spending_analyzer/
+├── application.py       Import and processing workflow
+├── categorization.py    Rules and interactive questions
+├── constants.py         Defaults and supported CSV headers
+├── providers.py         Bank CSV normalization
+├── reports.py           Monthly summaries and reports
+└── storage.py           Local JSON persistence
+run.sh                    macOS launcher
+settings.example.json     Documented configuration shape
+tests/                    Tests with fictional transactions
+docs/adding-a-bank.md     Provider extension guide
 ```
 
-The project intentionally remains a single Python application in v1. It can be read top-to-bottom and run with `run.sh` without learning Python packaging first. The major sections are separated by focused functions: CSV recognition and normalization, rule application, interactive review, aggregation, report generation, and orchestration.
+The package is split by responsibility, while `run.sh` keeps everyday use to one command. Start with `application.py` to follow the overall workflow, then open the focused module for the part you want to change.
 
 ## Testing
 

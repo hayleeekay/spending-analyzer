@@ -11,5 +11,6 @@ if [ ! -x "$project_dir/.venv/bin/python" ]; then
     exit 1
 fi
 
-exec "$project_dir/.venv/bin/python" "$project_dir/spending_analyzer.py" \
+PYTHONPATH="$project_dir${PYTHONPATH:+:$PYTHONPATH}" \
+exec "$project_dir/.venv/bin/python" -m spending_analyzer \
     --data-dir "$project_dir/spending-data" "$@"

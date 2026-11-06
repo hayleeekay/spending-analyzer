@@ -16,4 +16,4 @@ dependencies = ["openpyxl>=3.1,<4"]
 spending-analyzer = "spending_analyzer:main"
 
 [tool.setuptools]
-py-modules = ["spending_analyzer"]
+packages = ["spending_analyzer"]

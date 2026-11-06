@@ -1,0 +1,268 @@
+"""End-to-end import, categorization, persistence, and reporting workflow."""
+
+from __future__ import annotations
+
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+import shutil
+import sys
+
+from .categorization import (
+    apply_rules_and_decisions,
+    ask_bill_responsibility,
+    migrate_legacy_rules,
+    prompt_for_bill_responsibilities,
+    prompt_for_categories,
+)
+from .constants import CATEGORIES
+from .providers import (
+    account_id,
+    clean_identifier_value,
+    normalize_row,
+    read_csv,
+    transaction_base_key,
+    unique_destination,
+)
+from .reports import generate_html, generate_xlsx, month_summary, write_month_csv
+from .storage import (
+    load_decision_shards,
+    load_json,
+    load_settings,
+    load_year_shards,
+    save_decision_shards,
+    save_json,
+    save_year_shards,
+    sha256_file,
+    stable_hash,
+)
+
+def process(root: Path, non_interactive: bool) -> int:
+    inbox = root / "inbox"
+    processed = root / "processed"
+    data_dir = root / "data"
+    rules_dir = root / "rules"
+    reports_dir = root / "reports"
+    for directory in (inbox, processed, data_dir, rules_dir, reports_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    import_path = data_dir / "imports.json"
+    rule_path = rules_dir / "rules.json"
+    category_path = rules_dir / "categories.json"
+    people_path = rules_dir / "people.json"
+    settings_path = rules_dir / "settings.json"
+    transaction_dir = data_dir / "transactions"
+    decision_dir = data_dir / "decisions"
+    transactions = load_year_shards(transaction_dir)
+    for transaction in transactions:
+        transaction["identifier"] = clean_identifier_value(transaction["provider"], transaction["identifier"])
+    imports = load_json(import_path, [])
+    decisions = load_decision_shards(decision_dir)
+    rules = load_json(rule_path, [])
+    categories = load_json(category_path, list(CATEGORIES))
+    people = load_json(people_path, [])
+    settings = load_settings(settings_path)
+    for default_category in CATEGORIES:
+        if not any(category.casefold() == default_category.casefold() for category in categories):
+            insert_at = categories.index("Uncategorized") if "Uncategorized" in categories else len(categories)
+            categories.insert(insert_at, default_category)
+    for rule in rules:
+        if rule.get("provider") == "amex":
+            if rule.get("pattern"):
+                rule["pattern"] = clean_identifier_value("amex", rule["pattern"])
+            elif rule.get("identifier"):
+                rule["identifier"] = clean_identifier_value("amex", rule["identifier"])
+    known_people = {person.casefold() for person in people}
+    stored_responsibilities = [
+        decision.get("responsibility", "") for decision in decisions.values()
+    ] + [rule.get("responsibility", "") for rule in rules]
+    for decision in decisions.values():
+        stored_responsibilities.extend(
+            split.get("responsibility", "") for split in decision.get("splits", [])
+        )
+    for transaction in transactions:
+        stored_responsibilities.extend(
+            split.get("responsibility", "") for split in transaction.get("splits", [])
+        )
+    for person in stored_responsibilities:
+        if person and person.casefold() not in known_people:
+            people.append(person)
+            known_people.add(person.casefold())
+    known_files = {item["sha256"] for item in imports}
+    existing = {transaction["id"]: transaction for transaction in transactions}
+    csv_paths = sorted(path for path in inbox.iterdir() if path.is_file() and path.suffix.lower() == ".csv")
+    if not csv_paths:
+        print(f"No CSV files found in {inbox}")
+        if not transactions:
+            print("Drop bank exports there and run this command again.")
+            return 0
+        print("Using the existing transaction history; skipped categories can still be completed.")
+
+    imported_files = duplicate_files = failed_files = new_transactions = repeated_transactions = 0
+    affected_months: set[str] = set()
+    for path in csv_paths:
+        file_hash = sha256_file(path)
+        if file_hash in known_files:
+            destination = unique_destination(processed / "duplicates", path.name)
+            shutil.move(str(path), destination)
+            print(f"Duplicate file archived without reimporting: {path.name}")
+            duplicate_files += 1
+            continue
+        try:
+            provider, rows = read_csv(path)
+            account = account_id(provider, path.name)
+            occurrence: Counter[str] = Counter()
+            file_new = file_repeated = 0
+            dates: list[str] = []
+            for row in rows:
+                transaction = normalize_row(provider, account, row, path.name, settings)
+                base = transaction_base_key(transaction)
+                occurrence[base] += 1
+                transaction_id = stable_hash(base, occurrence[base])
+                transaction["id"] = transaction_id
+                dates.append(transaction["date"])
+                affected_months.add(transaction["date"][:7])
+                if transaction_id in existing:
+                    sources = existing[transaction_id].setdefault("source_files", [])
+                    if path.name not in sources:
+                        sources.append(path.name)
+                    file_repeated += 1
+                else:
+                    existing[transaction_id] = transaction
+                    file_new += 1
+            start = min(dates) if dates else "empty"
+            end = max(dates) if dates else "empty"
+            archive_name = f"{account}_{start}_to_{end}_{file_hash[:8]}.csv"
+            destination = unique_destination(processed / account, archive_name)
+            shutil.move(str(path), destination)
+            imports.append({
+                "sha256": file_hash,
+                "original_filename": path.name,
+                "archived_path": str(destination.relative_to(root)),
+                "provider": provider,
+                "account": account,
+                "date_range": [start, end],
+                "rows": len(rows),
+                "new_transactions": file_new,
+                "repeated_transactions": file_repeated,
+                "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
+            known_files.add(file_hash)
+            imported_files += 1
+            new_transactions += file_new
+            repeated_transactions += file_repeated
+            print(f"Imported {path.name}: {file_new} new, {file_repeated} already known")
+        except Exception as exc:
+            failed_files += 1
+            print(f"ERROR: Could not import {path.name}: {exc}", file=sys.stderr)
+
+    transactions = list(existing.values())
+    # Persist successful imports before interactive questions so an interruption
+    # never loses transactions whose source files have already been archived.
+    save_year_shards(transaction_dir, transactions)
+    save_json(import_path, imports)
+    migrated_rules = migrate_legacy_rules(rules, transactions)
+    always_ask_categories = set(settings.get("always_ask_person_categories", ["Bills"]))
+    category_person_defaults = settings.get("category_person_defaults", {})
+    personless_categories = set(settings.get("personless_categories", []))
+    personless_categories.add("Income")
+    other_people_categories = set(settings.get("other_people_categories", []))
+    def persist_answers() -> None:
+        save_decision_shards(decision_dir, decisions, transactions)
+        save_json(rule_path, rules)
+        save_json(category_path, categories)
+        save_json(people_path, people)
+        settings["personless_categories"] = sorted(personless_categories)
+        save_json(settings_path, settings)
+
+    default_person = settings.get("default_person", "")
+    if not non_interactive and transactions and (
+        not default_person or not any(person.casefold() == default_person.casefold() for person in people)
+    ):
+        default_person = ask_bill_responsibility(
+            "Choose the default person for transactions:", people, persist_answers
+        )
+        settings["default_person"] = default_person
+        persist_answers()
+    if default_person:
+        for decision in decisions.values():
+            category = decision.get("category", "")
+            if category in personless_categories:
+                decision.pop("responsibility", None)
+            if category and category not in {"Uncategorized", "Split"} and not decision.get("responsibility"):
+                if category not in always_ask_categories and category not in personless_categories:
+                    decision["responsibility"] = default_person
+            for split in decision.get("splits", []):
+                if split.get("category") in personless_categories:
+                    split.pop("responsibility", None)
+                elif not split.get("responsibility") and split.get("category") not in always_ask_categories:
+                    split["responsibility"] = default_person
+        for rule in rules:
+            if rule.get("category") in personless_categories:
+                rule.pop("responsibility", None)
+            elif rule.get("category") not in always_ask_categories and not rule.get("responsibility"):
+                rule["responsibility"] = default_person
+
+    apply_rules_and_decisions(transactions, rules, decisions)
+    categorized = 0 if non_interactive else prompt_for_categories(
+        transactions, rules, decisions, persist_answers, categories, people,
+        default_person, always_ask_categories, category_person_defaults,
+        personless_categories,
+    )
+    apply_rules_and_decisions(transactions, rules, decisions)
+    bills_assigned = 0 if non_interactive else prompt_for_bill_responsibilities(
+        transactions, rules, decisions, persist_answers, people=people,
+        personless_categories=personless_categories,
+    )
+    apply_rules_and_decisions(transactions, rules, decisions)
+    save_year_shards(transaction_dir, transactions)
+    save_json(import_path, imports)
+    save_decision_shards(decision_dir, decisions, transactions)
+    save_json(rule_path, rules)
+    save_json(category_path, categories)
+    save_json(people_path, people)
+    save_json(settings_path, settings)
+
+    months = sorted({transaction["date"][:7] for transaction in transactions})
+    by_month_dir = data_dir / "by-month"
+    by_month_dir.mkdir(parents=True, exist_ok=True)
+    for month in months:
+        month_transactions = [transaction for transaction in transactions if transaction["date"].startswith(month)]
+        month_report_dir = reports_dir / month
+        month_report_dir.mkdir(parents=True, exist_ok=True)
+        write_month_csv(month_transactions, by_month_dir / f"{month}.csv")
+        generate_html(
+            month, month_transactions, month_report_dir / "spending-report.html",
+            personless_categories, default_person, other_people_categories,
+        )
+        generate_xlsx(
+            month, month_transactions, month_report_dir / "spending-report.xlsx",
+            personless_categories, default_person, other_people_categories,
+        )
+
+    print("\nProcessing complete")
+    print(f"  Files imported: {imported_files}")
+    print(f"  Duplicate files skipped: {duplicate_files}")
+    print(f"  Files with errors (left in inbox): {failed_files}")
+    print(f"  New transactions: {new_transactions}")
+    print(f"  Repeated transaction rows merged: {repeated_transactions}")
+    print(f"  Transactions categorized this run: {categorized}")
+    print(f"  People assigned this run: {bills_assigned}")
+    if migrated_rules:
+        print(f"  Older rules safely assigned to an account: {migrated_rules}")
+    print(f"  Months currently reported: {', '.join(months) if months else 'none'}")
+    if months:
+        latest = months[-1]
+        summary = month_summary(
+            [transaction for transaction in transactions if transaction["date"].startswith(latest)],
+            personless_categories, default_person, other_people_categories,
+        )
+        print(f"\nLatest month ({latest})")
+        print(f"  Income: ${summary['income']:,.2f}")
+        print(f"  Estimated reimbursements: ${summary['reimbursements']:,.2f}")
+        print(f"  Spending assigned to others: ${summary['other_people_spending']:,.2f}")
+        print(f"  Others spending minus reimbursements: ${summary['other_people_after_reimbursements']:,.2f}")
+        print(f"  Net spending: ${summary['net_spending']:,.2f}")
+        print(f"  Uncategorized expenses/refunds: {summary['uncategorized_count']}")
+        print(f"  Reports: {reports_dir / latest}")
+    return 1 if failed_files else 0
