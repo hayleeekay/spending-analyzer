@@ -192,6 +192,27 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual([item["original_filename"] for item in imports], ["initial.csv"])
         self.assertTrue(failed_path.exists())
 
+    def test_archive_failure_does_not_commit_staged_transactions(self):
+        source_path = self.inbox / "discover.csv"
+        write_csv(
+            source_path,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+
+        with (
+            patch("spending_analyzer.application.shutil.move", side_effect=OSError("archive failed")),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertEqual(analyzer.load_year_shards(self.root / "data/transactions"), [])
+        self.assertEqual(json.loads((self.root / "data/imports.json").read_text()), [])
+        self.assertTrue(source_path.exists())
+
     def test_rule_application_does_not_use_bank_category(self):
         transaction = {
             "id": "one", "provider": "apple", "account": "apple", "identifier": "CAFE", "kind": "expense"
