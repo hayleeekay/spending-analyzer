@@ -212,6 +212,38 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertIn((None, "2026-07-10", "ELECTRIC COMPANY", "Apple Card", "Expense", 85.25), values)
         self.assertEqual(values[-1][0], "GRAND TOTAL")
 
+    def test_excel_preserves_imported_and_user_text_without_formulas(self):
+        transaction = {
+            "provider": "apple", "account": "apple", "date": "2026-07-10",
+            "post_date": "2026-07-11", "description": "=1+1",
+            "kind": "expense", "raw_amount": "12.34", "category": "=CATEGORY",
+            "responsibility": "=PERSON", "identifier": "=IDENTIFIER",
+            "bank_category": "=BANK CATEGORY", "bank_type": "=BANK TYPE", "splits": [],
+        }
+        destination = self.root / "text-report.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", [transaction], destination, default_person="=PERSON",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=False)
+        self.addCleanup(workbook.close)
+        formula_cells = [
+            f"{sheet.title}!{cell.coordinate}"
+            for sheet in workbook.worksheets
+            for row in sheet.iter_rows()
+            for cell in row
+            if cell.data_type == "f"
+        ]
+        self.assertEqual(formula_cells, [])
+        transaction_values = [
+            cell.value for cell in workbook["Transactions"][2]
+        ]
+        self.assertEqual(transaction_values[2], "=1+1")
+        self.assertEqual(transaction_values[4], "=CATEGORY")
+        self.assertEqual(transaction_values[5], "=PERSON")
+        self.assertEqual(transaction_values[10:13], ["=IDENTIFIER", "=BANK CATEGORY", "=BANK TYPE"])
+
     def test_rules_are_scoped_to_account(self):
         first = {"id": "one", "provider": "chase_credit", "account": "chase_credit-1111", "identifier": "SAMPLE MERCHANT", "kind": "expense"}
         second = {"id": "two", "provider": "chase_credit", "account": "chase_credit-2222", "identifier": "SAMPLE MERCHANT", "kind": "expense"}
