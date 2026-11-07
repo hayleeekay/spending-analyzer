@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 from typing import Any
 
 from .categorization import (
@@ -37,6 +38,7 @@ from .storage import (
     sha256_file,
     stable_hash,
 )
+from .workspaces import LegacyWorkspaceError
 
 def process(
     root: Path,
@@ -45,6 +47,13 @@ def process(
     profile_name: str | None = None,
     external_import_source: Path | None = None,
 ) -> int:
+    legacy_folders = [path for path in (root / "inbox", root / "processed") if path.exists()]
+    if legacy_folders:
+        raise LegacyWorkspaceError(
+            f"An older workspace was found at {root}. "
+            "Convert it explicitly with --migrate-profile NAME."
+        )
+
     imports_dir = root / "imports"
     archive_dir = root / "archive"
     data_dir = root / "data"
@@ -85,10 +94,17 @@ def process(
                 already_seen += 1
                 continue
             destination = unique_destination(imports_dir, source.name)
-            shutil.copy2(source, destination)
-            if sha256_file(destination) != source_hash:
-                destination.unlink(missing_ok=True)
-                raise OSError(f"External CSV changed while it was being copied: {source}")
+            with tempfile.NamedTemporaryFile(
+                dir=imports_dir, prefix=".external-import-", suffix=".tmp", delete=False,
+            ) as temporary_handle:
+                temporary = Path(temporary_handle.name)
+            try:
+                shutil.copy2(source, temporary)
+                if sha256_file(temporary) != source_hash:
+                    raise OSError(f"External CSV changed while it was being copied: {source}")
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
             pending_hashes.add(source_hash)
             copied += 1
         print(f"External import source: {external_import_source} (read-only)")

@@ -89,7 +89,9 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertIn("Setup: 1 rule, 12 categories, 0 people", profile_result.stdout)
         jordan_result = run_launcher("--profile", "jordan")
         self.assertIn("Setup: 0 rules, 12 categories, 0 people", jordan_result.stdout)
-        self.assertFalse((project / "spending-data/jordan/rules/rules.json").exists())
+        self.assertFalse(
+            (project / "spending-data/profiles/jordan/rules/rules.json").exists()
+        )
 
         fictional_row = {
             "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
@@ -172,9 +174,17 @@ class SpendingAnalyzerTest(unittest.TestCase):
 
         legacy = Path(self.temporary.name) / "legacy"
         (legacy / "inbox").mkdir(parents=True)
-        (legacy / "processed").mkdir()
+        (legacy / "processed/discover").mkdir(parents=True)
+        (legacy / "processed/discover/original.csv").write_text(
+            "fictional archive", encoding="utf-8",
+        )
+        (legacy / "data").mkdir()
         (legacy / "rules").mkdir()
         (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+        analyzer.save_json(legacy / "data/imports.json", [{
+            "sha256": "fictional",
+            "archived_path": "processed/discover/original.csv",
+        }])
         with self.assertRaises(analyzer.LegacyWorkspaceError):
             analyzer.initialize_storage(legacy)
 
@@ -185,6 +195,9 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertTrue((profile / "data").is_dir())
         self.assertFalse((legacy / "inbox").exists())
         self.assertEqual(analyzer.profile_names(legacy), ["alex"])
+        import_record = json.loads((profile / "data/imports.json").read_text())[0]
+        self.assertEqual(import_record["archived_path"], "archive/discover/original.csv")
+        self.assertTrue((profile / import_record["archived_path"]).exists())
 
         rollback = Path(self.temporary.name) / "rollback"
         (rollback / "inbox").mkdir(parents=True)
@@ -208,6 +221,46 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertTrue((rollback / "inbox/sample.csv").exists())
         self.assertTrue((rollback / "data").is_dir())
         self.assertFalse((rollback / "profiles").exists())
+
+    def test_interrupted_legacy_conversion_rolls_back_every_move(self):
+        legacy = Path(self.temporary.name) / "interrupted-legacy"
+        (legacy / "inbox").mkdir(parents=True)
+        (legacy / "data").mkdir()
+        (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+        real_move = shutil.move
+        move_count = 0
+
+        def interrupt_second_move(source, destination):
+            nonlocal move_count
+            move_count += 1
+            if move_count == 2:
+                raise KeyboardInterrupt()
+            return real_move(source, destination)
+
+        with patch(
+            "spending_analyzer.workspaces.shutil.move",
+            side_effect=interrupt_second_move,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.migrate_legacy_workspace(legacy, "alex")
+        self.assertTrue((legacy / "inbox/sample.csv").exists())
+        self.assertTrue((legacy / "data").is_dir())
+        self.assertFalse((legacy / "profiles").exists())
+
+        profile = analyzer.migrate_legacy_workspace(legacy, "alex")
+        self.assertTrue((profile / "imports/sample.csv").exists())
+        self.assertTrue((profile / "data").is_dir())
+
+    def test_public_process_rejects_legacy_workspace_before_creating_folders(self):
+        legacy = Path(self.temporary.name) / "old-api"
+        (legacy / "inbox").mkdir(parents=True)
+        (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+
+        with self.assertRaisesRegex(analyzer.LegacyWorkspaceError, "--migrate-profile"):
+            analyzer.process(legacy, non_interactive=True)
+        self.assertTrue((legacy / "inbox/sample.csv").exists())
+        self.assertFalse((legacy / "imports").exists())
+        self.assertFalse((legacy / "archive").exists())
 
     def test_external_import_source_is_copied_once_and_left_untouched(self):
         source = Path(self.temporary.name) / "external"
@@ -238,6 +291,48 @@ class SpendingAnalyzerTest(unittest.TestCase):
         )
         self.assertTrue(source_file.exists())
         self.assertEqual(len(list((self.root / "archive/discover").glob("*.csv"))), 1)
+
+    def test_failed_external_copy_never_leaves_an_importable_partial_csv(self):
+        source = Path(self.temporary.name) / "external"
+        source_file = source / "discover.csv"
+        write_csv(
+            source_file,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "FICTIONAL STORE", "Amount": "10.00",
+                "Category": "Shopping",
+            }],
+        )
+
+        def leave_partial_copy(_source, destination):
+            Path(destination).write_text(
+                "Trans. Date,Post Date,Description,Amount,Category\n"
+                "07/01/2026,07/02/2026,PARTIAL,1.00,Shopping\n",
+                encoding="utf-8",
+            )
+            raise OSError("fictional interrupted copy")
+
+        with patch(
+            "spending_analyzer.application.shutil.copy2",
+            side_effect=leave_partial_copy,
+        ):
+            with self.assertRaisesRegex(OSError, "fictional interrupted copy"):
+                analyzer.process(
+                    self.root, non_interactive=True, external_import_source=source,
+                )
+        self.assertEqual(list(self.imports.iterdir()), [])
+        self.assertTrue(source_file.exists())
+
+        self.assertEqual(
+            analyzer.process(
+                self.root, non_interactive=True, external_import_source=source,
+            ),
+            0,
+        )
+        transactions = analyzer.load_year_shards(self.root / "data/transactions")
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["raw_amount"], "10.00")
 
     def test_csv_in_workspace_root_is_not_imported(self):
         misplaced = self.root / "misplaced.csv"

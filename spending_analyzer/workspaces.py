@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 import shutil
 
-from .storage import save_json
+from .storage import load_json, save_json
 
 
 FORMAT_VERSION = 1
@@ -143,6 +144,8 @@ def migrate_legacy_workspace(storage_dir: Path, name: str) -> Path:
     profile_dir.mkdir()
     moved: list[tuple[Path, Path]] = []
     created_folders: list[Path] = []
+    original_imports: list[dict] | None = None
+    imports_path = profile_dir / "data" / "imports.json"
     try:
         for old_name, new_name in LEGACY_FOLDER_NAMES.items():
             source = storage_dir / old_name
@@ -155,18 +158,38 @@ def migrate_legacy_workspace(storage_dir: Path, name: str) -> Path:
             if not path.exists():
                 path.mkdir()
                 created_folders.append(path)
+        if imports_path.exists():
+            original_imports = load_json(imports_path, [])
+            if not isinstance(original_imports, list) or not all(
+                isinstance(record, dict) for record in original_imports
+            ):
+                raise ValueError(f"Import history must be a JSON list: {imports_path}")
+            updated_imports = deepcopy(original_imports)
+            for record in updated_imports:
+                archived_path = record.get("archived_path")
+                if isinstance(archived_path, str) and (
+                    archived_path.startswith("processed/")
+                    or archived_path.startswith("processed\\")
+                ):
+                    record["archived_path"] = "archive" + archived_path[len("processed"):]
+            if updated_imports != original_imports:
+                save_json(imports_path, updated_imports)
         save_json(storage_dir / MARKER_NAME, {"format_version": FORMAT_VERSION})
-    except Exception:
+    except BaseException:
         (storage_dir / f"{MARKER_NAME}.tmp").unlink(missing_ok=True)
-        for source, destination in reversed(moved):
-            if destination.exists() and not source.exists():
-                shutil.move(str(destination), source)
-        for path in reversed(created_folders):
-            if path.exists() and not any(path.iterdir()):
-                path.rmdir()
-        if profile_dir.exists() and not any(profile_dir.iterdir()):
-            profile_dir.rmdir()
-        if profiles_dir.exists() and not any(profiles_dir.iterdir()):
-            profiles_dir.rmdir()
+        try:
+            if original_imports is not None and imports_path.exists():
+                save_json(imports_path, original_imports)
+        finally:
+            for source, destination in reversed(moved):
+                if destination.exists() and not source.exists():
+                    shutil.move(str(destination), source)
+            for path in reversed(created_folders):
+                if path.exists() and not any(path.iterdir()):
+                    path.rmdir()
+            if profile_dir.exists() and not any(profile_dir.iterdir()):
+                profile_dir.rmdir()
+            if profiles_dir.exists() and not any(profiles_dir.iterdir()):
+                profiles_dir.rmdir()
         raise
     return profile_dir
