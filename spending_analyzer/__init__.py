@@ -63,5 +63,17 @@ from .storage import (
     sha256_file,
     stable_hash,
 )
+from .workspaces import (
+    FORMAT_VERSION,
+    LEGACY_FOLDER_NAMES,
+    MARKER_NAME,
+    PROFILE_FOLDERS,
+    LegacyWorkspaceError,
+    has_legacy_workspace,
+    initialize_profile,
+    initialize_storage,
+    migrate_legacy_workspace,
+    profile_names,
+)
 
 __all__ = [name for name in globals() if not name.startswith("_")]

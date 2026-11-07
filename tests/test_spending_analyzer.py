@@ -1,5 +1,6 @@
 import csv
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,8 +24,8 @@ class SpendingAnalyzerTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "spending-data"
-        self.inbox = self.root / "inbox"
-        self.inbox.mkdir(parents=True)
+        self.imports = self.root / "imports"
+        self.imports.mkdir(parents=True)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -44,7 +45,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unrecognized CSV layout.*Chase credit requires"):
             analyzer.detect_provider(["Date", "Merchant Name", "Value"])
 
-    def test_launcher_resolves_data_paths_from_the_calling_directory(self):
+    def test_launcher_creates_and_selects_profiles(self):
         temporary_root = Path(self.temporary.name)
         project = temporary_root / "project"
         caller = temporary_root / "caller"
@@ -53,51 +54,394 @@ class SpendingAnalyzerTest(unittest.TestCase):
         shutil.copy2(source_root / "run.sh", project / "run.sh")
         python = project / ".venv/bin/python"
         python.parent.mkdir(parents=True)
-        python.symlink_to(sys.executable)
+        python.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        python.chmod(0o755)
         caller.mkdir()
 
-        def run_launcher(*arguments: str) -> None:
-            subprocess.run(
+        def run_launcher(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
                 [project / "run.sh", *arguments, "--non-interactive"],
                 cwd=caller,
-                check=True,
+                check=check,
                 capture_output=True,
                 text=True,
             )
 
-        run_launcher("--data-dir", "./relative-data")
-        self.assertTrue((caller / "relative-data/inbox").is_dir())
-        self.assertFalse((project / "relative-data").exists())
+        profile_result = run_launcher("--profile", "Alex")
+        alex_profile = project / "spending-data/profiles/alex"
+        self.assertTrue((alex_profile / "imports").is_dir())
+        self.assertTrue((alex_profile / "archive").is_dir())
+        self.assertIn("Profile: alex", profile_result.stdout)
+        self.assertIn(
+            f"Import folder: {(alex_profile / 'imports').resolve()}",
+            profile_result.stdout,
+        )
+        self.assertIn("Setup: 0 rules, 12 categories, 0 people", profile_result.stdout)
 
-        run_launcher("--data-dir=./equals-data")
-        self.assertTrue((caller / "equals-data/inbox").is_dir())
-        self.assertFalse((project / "equals-data").exists())
+        analyzer.save_json(alex_profile / "rules/rules.json", [{
+            "provider": "discover", "account": "discover", "pattern": "FICTIONAL",
+            "match_type": "exact", "category": "Other", "reviewed": True,
+        }])
+        profile_result = run_launcher("--profile", "alex")
+        self.assertIn("Setup: 1 rule, 12 categories, 0 people", profile_result.stdout)
+        jordan_result = run_launcher("--profile", "jordan")
+        self.assertIn("Setup: 0 rules, 12 categories, 0 people", jordan_result.stdout)
+        self.assertFalse(
+            (project / "spending-data/profiles/jordan/rules/rules.json").exists()
+        )
 
-        absolute_data = temporary_root / "absolute-data"
-        run_launcher("--data-dir", str(absolute_data))
-        self.assertTrue((absolute_data / "inbox").is_dir())
+        fictional_row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "FICTIONAL", "Amount": "10.00", "Category": "Shopping",
+        }
+        for profile in ("alex", "jordan"):
+            write_csv(
+                project / f"spending-data/profiles/{profile}/imports/discover.csv",
+                list(analyzer.PROVIDER_HEADERS["discover"]),
+                [fictional_row],
+            )
+            run_launcher("--profile", profile)
+        alex_transactions = json.loads(
+            (project / "spending-data/profiles/alex/data/transactions/2026.json").read_text()
+        )
+        jordan_transactions = json.loads(
+            (project / "spending-data/profiles/jordan/data/transactions/2026.json").read_text()
+        )
+        self.assertEqual(alex_transactions[0]["category"], "Other")
+        self.assertEqual(jordan_transactions[0]["category"], "Uncategorized")
 
-        run_launcher()
-        self.assertTrue((project / "spending-data/inbox").is_dir())
+        alias_profile = project / "spending-data/profiles/alias"
+        alias_profile.symlink_to(project / "spending-data/profiles/jordan", target_is_directory=True)
+        jordan_before = (project / "spending-data/profiles/jordan/data/transactions/2026.json").read_text()
+        alias_result = run_launcher("--profile", "alias", check=False)
+        self.assertEqual(alias_result.returncode, 1)
+        self.assertIn("cannot be a symbolic link", alias_result.stderr)
+        self.assertEqual(
+            (project / "spending-data/profiles/jordan/data/transactions/2026.json").read_text(),
+            jordan_before,
+        )
+
+        absolute_storage = temporary_root / "absolute-storage"
+        custom_profile = run_launcher(
+            "--storage-dir", str(absolute_storage), "--profile", "alex"
+        )
+        self.assertTrue((absolute_storage / "profiles/alex/imports").is_dir())
+        self.assertIn(
+            f"Profile folder: {(absolute_storage / 'profiles/alex').resolve()}",
+            custom_profile.stdout,
+        )
+
+        relative_profile = run_launcher(
+            "--storage-dir", "./profile-base", "--profile", "alex"
+        )
+        self.assertTrue((caller / "profile-base/profiles/alex/imports").is_dir())
+        self.assertFalse((project / "profile-base").exists())
+
+        unsafe = run_launcher("--profile", "../outside", check=False)
+        self.assertEqual(unsafe.returncode, 2)
+        self.assertFalse((project / "outside").exists())
+        reserved = run_launcher("--profile", "rules", check=False)
+        self.assertEqual(reserved.returncode, 2)
+        self.assertIn("reserved", reserved.stderr)
+
+        multiple = run_launcher(check=False)
+        self.assertEqual(multiple.returncode, 1)
+        self.assertIn("More than one profile exists", multiple.stderr)
+        self.assertIn("alex, jordan", multiple.stderr)
+
+        single_storage = temporary_root / "single-storage"
+        run_launcher("--storage-dir", str(single_storage), "--profile", "only")
+        single = run_launcher("--storage-dir", str(single_storage))
+        self.assertIn("Profile: only", single.stdout)
+
+        help_result = subprocess.run(
+            [project / "run.sh", "help"], cwd=caller, check=True,
+            capture_output=True, text=True,
+        )
+        self.assertIn("quick start:", help_result.stdout)
+        self.assertIn("--import-from", help_result.stdout)
+
+    def test_storage_initialization_and_legacy_conversion_are_explicit(self):
+        storage = Path(self.temporary.name) / "storage"
+        storage.mkdir()
+        (storage / "unrelated.txt").write_text("keep me", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Refusing to initialize"):
+            analyzer.initialize_storage(storage)
+        self.assertEqual((storage / "unrelated.txt").read_text(), "keep me")
+
+        legacy = Path(self.temporary.name) / "legacy"
+        (legacy / "inbox").mkdir(parents=True)
+        (legacy / "processed/discover").mkdir(parents=True)
+        (legacy / "processed/discover/original.csv").write_text(
+            "fictional archive", encoding="utf-8",
+        )
+        (legacy / "data").mkdir()
+        (legacy / "rules").mkdir()
+        (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+        analyzer.save_json(legacy / "data/imports.json", [{
+            "sha256": "fictional",
+            "archived_path": "processed/discover/original.csv",
+        }])
+        with self.assertRaises(analyzer.LegacyWorkspaceError):
+            analyzer.initialize_storage(legacy)
+
+        profile = analyzer.migrate_legacy_workspace(legacy, "alex")
+        self.assertEqual(profile, legacy / "profiles/alex")
+        self.assertTrue((profile / "imports/sample.csv").exists())
+        self.assertTrue((profile / "archive").is_dir())
+        self.assertTrue((profile / "data").is_dir())
+        self.assertFalse((legacy / "inbox").exists())
+        self.assertEqual(analyzer.profile_names(legacy), ["alex"])
+        import_record = json.loads((profile / "data/imports.json").read_text())[0]
+        self.assertEqual(import_record["archived_path"], "archive/discover/original.csv")
+        self.assertTrue((profile / import_record["archived_path"]).exists())
+
+        rollback = Path(self.temporary.name) / "rollback"
+        (rollback / "inbox").mkdir(parents=True)
+        (rollback / "data").mkdir()
+        (rollback / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+        real_move = shutil.move
+        move_count = 0
+
+        def fail_second_move(source, destination):
+            nonlocal move_count
+            move_count += 1
+            if move_count == 2:
+                raise OSError("fictional move failure")
+            return real_move(source, destination)
+
+        with patch(
+            "spending_analyzer.workspaces.shutil.move", side_effect=fail_second_move,
+        ):
+            with self.assertRaisesRegex(OSError, "fictional move failure"):
+                analyzer.migrate_legacy_workspace(rollback, "alex")
+        self.assertTrue((rollback / "inbox/sample.csv").exists())
+        self.assertTrue((rollback / "data").is_dir())
+        self.assertFalse((rollback / "profiles").exists())
+
+    def test_interrupted_legacy_conversion_rolls_back_every_move(self):
+        real_move = shutil.move
+
+        for timing in ("before", "after"):
+            with self.subTest(timing=timing):
+                legacy = Path(self.temporary.name) / f"interrupted-{timing}"
+                (legacy / "inbox").mkdir(parents=True)
+                (legacy / "data").mkdir()
+                (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+                move_count = 0
+
+                def interrupt_second_move(source, destination):
+                    nonlocal move_count
+                    move_count += 1
+                    if move_count == 2 and timing == "before":
+                        raise KeyboardInterrupt()
+                    result = real_move(source, destination)
+                    if move_count == 2 and timing == "after":
+                        raise KeyboardInterrupt()
+                    return result
+
+                with patch(
+                    "spending_analyzer.workspaces.shutil.move",
+                    side_effect=interrupt_second_move,
+                ):
+                    with self.assertRaises(KeyboardInterrupt):
+                        analyzer.migrate_legacy_workspace(legacy, "alex")
+                self.assertTrue((legacy / "inbox/sample.csv").exists())
+                self.assertTrue((legacy / "data").is_dir())
+                self.assertFalse((legacy / "profiles").exists())
+
+                profile = analyzer.migrate_legacy_workspace(legacy, "alex")
+                self.assertTrue((profile / "imports/sample.csv").exists())
+                self.assertTrue((profile / "data").is_dir())
+
+    def test_interrupt_after_marker_write_restores_legacy_workspace_for_retry(self):
+        legacy = Path(self.temporary.name) / "marker-interrupted"
+        (legacy / "inbox").mkdir(parents=True)
+        (legacy / "processed/discover").mkdir(parents=True)
+        (legacy / "data").mkdir()
+        (legacy / "inbox/sample.csv").write_text("fictional import", encoding="utf-8")
+        (legacy / "processed/discover/original.csv").write_text(
+            "fictional archive", encoding="utf-8",
+        )
+        original_imports = [{
+            "sha256": "fictional",
+            "archived_path": "processed/discover/original.csv",
+        }]
+        analyzer.save_json(legacy / "data/imports.json", original_imports)
+        real_save_json = analyzer.save_json
+
+        def interrupt_after_marker(path, value):
+            real_save_json(path, value)
+            if path.name == analyzer.MARKER_NAME:
+                raise KeyboardInterrupt()
+
+        with patch(
+            "spending_analyzer.workspaces.save_json",
+            side_effect=interrupt_after_marker,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.migrate_legacy_workspace(legacy, "alex")
+
+        self.assertFalse((legacy / analyzer.MARKER_NAME).exists())
+        self.assertTrue((legacy / "inbox/sample.csv").exists())
+        self.assertTrue((legacy / "processed/discover/original.csv").exists())
+        self.assertEqual(
+            json.loads((legacy / "data/imports.json").read_text()),
+            original_imports,
+        )
+        self.assertFalse((legacy / "profiles").exists())
+        with self.assertRaises(analyzer.LegacyWorkspaceError):
+            analyzer.initialize_storage(legacy)
+
+        profile = analyzer.migrate_legacy_workspace(legacy, "alex")
+        migrated_record = json.loads((profile / "data/imports.json").read_text())[0]
+        self.assertEqual(
+            migrated_record["archived_path"], "archive/discover/original.csv",
+        )
+        self.assertTrue((profile / migrated_record["archived_path"]).exists())
+
+    def test_storage_rejects_marker_with_legacy_folders(self):
+        storage = Path(self.temporary.name) / "inconsistent-storage"
+        (storage / "inbox").mkdir(parents=True)
+        analyzer.save_json(
+            storage / analyzer.MARKER_NAME,
+            {"format_version": analyzer.FORMAT_VERSION},
+        )
+
+        with self.assertRaisesRegex(analyzer.LegacyWorkspaceError, "both"):
+            analyzer.initialize_storage(storage)
+        self.assertFalse((storage / "profiles").exists())
+        with patch("sys.stderr"):
+            self.assertEqual(
+                analyzer.main([
+                    "--storage-dir", str(storage), "--profile", "alex",
+                    "--non-interactive",
+                ]),
+                1,
+            )
+        self.assertFalse((storage / "profiles").exists())
+
+    def test_public_process_rejects_legacy_workspace_before_creating_folders(self):
+        legacy = Path(self.temporary.name) / "old-api"
+        (legacy / "inbox").mkdir(parents=True)
+        (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+
+        with self.assertRaisesRegex(analyzer.LegacyWorkspaceError, "--migrate-profile"):
+            analyzer.process(legacy, non_interactive=True)
+        self.assertTrue((legacy / "inbox/sample.csv").exists())
+        self.assertFalse((legacy / "imports").exists())
+        self.assertFalse((legacy / "archive").exists())
+
+    def test_external_import_source_is_copied_once_and_left_untouched(self):
+        source = Path(self.temporary.name) / "external"
+        source_file = source / "discover.csv"
+        write_csv(
+            source_file,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "FICTIONAL STORE", "Amount": "10.00",
+                "Category": "Shopping",
+            }],
+        )
+        self.assertEqual(
+            analyzer.process(
+                self.root, non_interactive=True, external_import_source=source,
+            ),
+            0,
+        )
+        self.assertTrue(source_file.exists())
+        self.assertEqual(len(list((self.root / "archive/discover").glob("*.csv"))), 1)
+
+        self.assertEqual(
+            analyzer.process(
+                self.root, non_interactive=True, external_import_source=source,
+            ),
+            0,
+        )
+        self.assertTrue(source_file.exists())
+        self.assertEqual(len(list((self.root / "archive/discover").glob("*.csv"))), 1)
+
+    def test_failed_external_copy_never_leaves_an_importable_partial_csv(self):
+        source = Path(self.temporary.name) / "external"
+        source_file = source / "discover.csv"
+        write_csv(
+            source_file,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "FICTIONAL STORE", "Amount": "10.00",
+                "Category": "Shopping",
+            }],
+        )
+
+        def leave_partial_copy(_source, destination):
+            Path(destination).write_text(
+                "Trans. Date,Post Date,Description,Amount,Category\n"
+                "07/01/2026,07/02/2026,PARTIAL,1.00,Shopping\n",
+                encoding="utf-8",
+            )
+            raise OSError("fictional interrupted copy")
+
+        with patch(
+            "spending_analyzer.application.shutil.copy2",
+            side_effect=leave_partial_copy,
+        ):
+            with self.assertRaisesRegex(OSError, "fictional interrupted copy"):
+                analyzer.process(
+                    self.root, non_interactive=True, external_import_source=source,
+                )
+        self.assertEqual(list(self.imports.iterdir()), [])
+        self.assertTrue(source_file.exists())
+
+        self.assertEqual(
+            analyzer.process(
+                self.root, non_interactive=True, external_import_source=source,
+            ),
+            0,
+        )
+        transactions = analyzer.load_year_shards(self.root / "data/transactions")
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["raw_amount"], "10.00")
+
+    def test_csv_in_workspace_root_is_not_imported(self):
+        misplaced = self.root / "misplaced.csv"
+        write_csv(
+            misplaced,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "FICTIONAL STORE", "Amount": "10.00",
+                "Category": "Shopping",
+            }],
+        )
+        with patch("sys.stderr") as stderr:
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertTrue(misplaced.exists())
+        self.assertIn("were not imported", stderr.write.call_args_list[0].args[0])
+        self.assertFalse((self.root / "data/transactions/2026.json").exists())
 
     def test_all_providers_year_sharding_and_duplicate_file(self):
-        write_csv(self.inbox / "apple.csv", list(analyzer.PROVIDER_HEADERS["apple"]), [
+        write_csv(self.imports / "apple.csv", list(analyzer.PROVIDER_HEADERS["apple"]), [
             {"Transaction Date": "07/02/2026", "Clearing Date": "07/03/2026", "Description": "CAFE", "Merchant": "Cafe", "Category": "Restaurants", "Type": "Purchase", "Amount (USD)": "12.34"},
             {"Transaction Date": "07/04/2026", "Clearing Date": "07/05/2026", "Description": "PAYMENT", "Merchant": "Payment", "Category": "Payment", "Type": "Payment", "Amount (USD)": "-50.00"},
         ])
-        write_csv(self.inbox / "Chase5678_test.CSV", list(analyzer.PROVIDER_HEADERS["chase_credit"]), [
+        write_csv(self.imports / "Chase5678_test.CSV", list(analyzer.PROVIDER_HEADERS["chase_credit"]), [
             {"Transaction Date": "06/01/2026", "Post Date": "06/02/2026", "Description": "STORE", "Category": "Shopping", "Type": "Sale", "Amount": "-20.00", "Memo": ""},
             {"Transaction Date": "06/03/2026", "Post Date": "06/03/2026", "Description": "STORE", "Category": "Shopping", "Type": "Return", "Amount": "5.00", "Memo": ""},
         ])
-        write_csv(self.inbox / "discover.csv", list(analyzer.PROVIDER_HEADERS["discover"]), [
+        write_csv(self.imports / "discover.csv", list(analyzer.PROVIDER_HEADERS["discover"]), [
             {"Trans. Date": "07/05/2026", "Post Date": "07/06/2026", "Description": "DINER", "Amount": "22.00", "Category": "Restaurants"},
             {"Trans. Date": "07/07/2026", "Post Date": "07/07/2026", "Description": "INTERNET PAYMENT - THANK YOU", "Amount": "-30.00", "Category": "Payments and Credits"},
         ])
-        write_csv(self.inbox / "activity.csv", list(analyzer.PROVIDER_HEADERS["amex"]), [
+        write_csv(self.imports / "activity.csv", list(analyzer.PROVIDER_HEADERS["amex"]), [
             {"Date": "07/08/2026", "Description": "MARKET", "Amount": "14.00", "Extended Details": "", "Appears On Your Statement As": "MARKET", "Address": "", "City/State": "", "Zip Code": "", "Country": "", "Reference": "r1", "Category": "Groceries"},
             {"Date": "07/09/2026", "Description": "MOBILE PAYMENT - THANK YOU", "Amount": "-14.00", "Extended Details": "", "Appears On Your Statement As": "MOBILE PAYMENT - THANK YOU", "Address": "", "City/State": "", "Zip Code": "", "Country": "", "Reference": "r2", "Category": ""},
         ])
-        write_csv(self.inbox / "Chase1234_test.CSV", list(analyzer.PROVIDER_HEADERS["chase_checking"]), [
+        write_csv(self.imports / "Chase1234_test.CSV", list(analyzer.PROVIDER_HEADERS["chase_checking"]), [
             {"Details": "CREDIT", "Posting Date": "07/10/2026", "Description": "PAYROLL", "Amount": "1000", "Type": "ACH_CREDIT", "Balance": "1000", "Check or Slip #": ""},
             {"Details": "CREDIT", "Posting Date": "07/11/2026", "Description": "ZELLE FROM FRIEND", "Amount": "40", "Type": "PARTNERFI_TO_CHASE", "Balance": "1040", "Check or Slip #": ""},
             {"Details": "DSLIP", "Posting Date": "07/12/2026", "Description": "DEPOSIT", "Amount": "60", "Type": "DEPOSIT", "Balance": "1100", "Check or Slip #": ""},
@@ -115,7 +459,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertTrue((self.root / "reports/2026-07/spending-report.xlsx").exists())
         self.assertTrue((self.root / "reports/2026-07/spending-report.html").exists())
         self.assertTrue((self.root / "reports/2026-06/spending-report.xlsx").exists())
-        self.assertEqual(len(list(self.inbox.iterdir())), 0)
+        self.assertEqual(len(list(self.imports.iterdir())), 0)
         from openpyxl import load_workbook
         workbook = load_workbook(self.root / "reports/2026-07/spending-report.xlsx", data_only=True)
         self.assertEqual(workbook.sheetnames[0], "Dashboard")
@@ -136,7 +480,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(cafe[6], 12.34)
         self.assertEqual(cafe[8], -12.34)
 
-        write_csv(self.inbox / "apple-overlap.csv", list(analyzer.PROVIDER_HEADERS["apple"]), [
+        write_csv(self.imports / "apple-overlap.csv", list(analyzer.PROVIDER_HEADERS["apple"]), [
             {"Transaction Date": "07/02/2026", "Clearing Date": "07/03/2026", "Description": "CAFE", "Merchant": "Cafe", "Category": "Restaurants", "Type": "Purchase", "Amount (USD)": "12.34"},
             {"Transaction Date": "08/01/2026", "Clearing Date": "08/02/2026", "Description": "SHOP", "Merchant": "Shop", "Category": "Other", "Type": "Purchase", "Amount (USD)": "9.99"},
         ])
@@ -146,13 +490,13 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(len(after_overlap), before_overlap + 1)
         self.assertTrue((self.root / "reports/2026-08/spending-report.xlsx").exists())
 
-        archived = next((self.root / "processed/apple").glob("*.csv"))
-        shutil.copy2(archived, self.inbox / "same-download.csv")
+        archived = next((self.root / "archive/apple").glob("*.csv"))
+        shutil.copy2(archived, self.imports / "same-download.csv")
         before = len(after_overlap)
         self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
         after = len(json.loads((self.root / "data/transactions/2026.json").read_text()))
         self.assertEqual(before, after)
-        self.assertEqual(len(list((self.root / "processed/duplicates").glob("*.csv"))), 1)
+        self.assertEqual(len(list((self.root / "archive/duplicates").glob("*.csv"))), 1)
 
     def test_failed_file_does_not_persist_partial_transactions(self):
         existing_row = {
@@ -160,7 +504,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
             "Description": "EXISTING", "Amount": "10.00", "Category": "Shopping",
         }
         write_csv(
-            self.inbox / "initial.csv",
+            self.imports / "initial.csv",
             list(analyzer.PROVIDER_HEADERS["discover"]),
             [existing_row],
         )
@@ -168,7 +512,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         transaction_path = self.root / "data/transactions/2026.json"
         before = json.loads(transaction_path.read_text())
 
-        failed_path = self.inbox / "failed.csv"
+        failed_path = self.imports / "failed.csv"
         write_csv(
             failed_path,
             list(analyzer.PROVIDER_HEADERS["discover"]),
@@ -193,7 +537,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertTrue(failed_path.exists())
 
     def test_archive_failure_does_not_commit_staged_transactions(self):
-        source_path = self.inbox / "discover.csv"
+        source_path = self.imports / "discover.csv"
         write_csv(
             source_path,
             list(analyzer.PROVIDER_HEADERS["discover"]),
@@ -398,7 +742,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(summary["categories"]["Gifts"], analyzer.money("50"))
         self.assertEqual(summary["spending"], analyzer.money("80"))
 
-    def test_empty_inbox_can_finish_a_saved_transaction(self):
+    def test_empty_import_folder_can_finish_a_saved_transaction(self):
         transaction = {
             "id": "tx-one", "provider": "apple", "account": "apple", "date": "2026-07-02",
             "post_date": "2026-07-03", "description": "CAFE", "identifier": "CAFE",

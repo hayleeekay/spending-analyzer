@@ -7,6 +7,8 @@ This file is a short, manually updated history of each released version.
 - Split the application into focused modules without changing its saved data or terminal workflow.
 - Prevent Excel reports from interpreting imported text as formulas.
 - Keep CSVs that fail validation from saving partial transaction data.
+- Organize all financial data into isolated profiles with guided setup and selection.
+- Support read-only imports from an external folder.
 
 ## 1.0.0 - 2026-08-03
 
