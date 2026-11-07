@@ -43,6 +43,11 @@ def initialize_storage(storage_dir: Path) -> bool:
     """
     marker = storage_dir / MARKER_NAME
     if marker.exists():
+        if has_legacy_workspace(storage_dir):
+            raise LegacyWorkspaceError(
+                f"Storage is inconsistent at {storage_dir}: it has both a storage marker "
+                "and older workspace folders. No files were changed."
+            )
         try:
             metadata = json.loads(marker.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -176,6 +181,7 @@ def migrate_legacy_workspace(storage_dir: Path, name: str) -> Path:
                 save_json(imports_path, updated_imports)
         save_json(storage_dir / MARKER_NAME, {"format_version": FORMAT_VERSION})
     except BaseException:
+        (storage_dir / MARKER_NAME).unlink(missing_ok=True)
         (storage_dir / f"{MARKER_NAME}.tmp").unlink(missing_ok=True)
         try:
             if original_imports is not None and imports_path.exists():

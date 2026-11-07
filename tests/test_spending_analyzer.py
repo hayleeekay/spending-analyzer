@@ -257,6 +257,73 @@ class SpendingAnalyzerTest(unittest.TestCase):
                 self.assertTrue((profile / "imports/sample.csv").exists())
                 self.assertTrue((profile / "data").is_dir())
 
+    def test_interrupt_after_marker_write_restores_legacy_workspace_for_retry(self):
+        legacy = Path(self.temporary.name) / "marker-interrupted"
+        (legacy / "inbox").mkdir(parents=True)
+        (legacy / "processed/discover").mkdir(parents=True)
+        (legacy / "data").mkdir()
+        (legacy / "inbox/sample.csv").write_text("fictional import", encoding="utf-8")
+        (legacy / "processed/discover/original.csv").write_text(
+            "fictional archive", encoding="utf-8",
+        )
+        original_imports = [{
+            "sha256": "fictional",
+            "archived_path": "processed/discover/original.csv",
+        }]
+        analyzer.save_json(legacy / "data/imports.json", original_imports)
+        real_save_json = analyzer.save_json
+
+        def interrupt_after_marker(path, value):
+            real_save_json(path, value)
+            if path.name == analyzer.MARKER_NAME:
+                raise KeyboardInterrupt()
+
+        with patch(
+            "spending_analyzer.workspaces.save_json",
+            side_effect=interrupt_after_marker,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.migrate_legacy_workspace(legacy, "alex")
+
+        self.assertFalse((legacy / analyzer.MARKER_NAME).exists())
+        self.assertTrue((legacy / "inbox/sample.csv").exists())
+        self.assertTrue((legacy / "processed/discover/original.csv").exists())
+        self.assertEqual(
+            json.loads((legacy / "data/imports.json").read_text()),
+            original_imports,
+        )
+        self.assertFalse((legacy / "profiles").exists())
+        with self.assertRaises(analyzer.LegacyWorkspaceError):
+            analyzer.initialize_storage(legacy)
+
+        profile = analyzer.migrate_legacy_workspace(legacy, "alex")
+        migrated_record = json.loads((profile / "data/imports.json").read_text())[0]
+        self.assertEqual(
+            migrated_record["archived_path"], "archive/discover/original.csv",
+        )
+        self.assertTrue((profile / migrated_record["archived_path"]).exists())
+
+    def test_storage_rejects_marker_with_legacy_folders(self):
+        storage = Path(self.temporary.name) / "inconsistent-storage"
+        (storage / "inbox").mkdir(parents=True)
+        analyzer.save_json(
+            storage / analyzer.MARKER_NAME,
+            {"format_version": analyzer.FORMAT_VERSION},
+        )
+
+        with self.assertRaisesRegex(analyzer.LegacyWorkspaceError, "both"):
+            analyzer.initialize_storage(storage)
+        self.assertFalse((storage / "profiles").exists())
+        with patch("sys.stderr"):
+            self.assertEqual(
+                analyzer.main([
+                    "--storage-dir", str(storage), "--profile", "alex",
+                    "--non-interactive",
+                ]),
+                1,
+            )
+        self.assertFalse((storage / "profiles").exists())
+
     def test_public_process_rejects_legacy_workspace_before_creating_folders(self):
         legacy = Path(self.temporary.name) / "old-api"
         (legacy / "inbox").mkdir(parents=True)
