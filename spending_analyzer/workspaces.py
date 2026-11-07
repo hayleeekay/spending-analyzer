@@ -151,8 +151,8 @@ def migrate_legacy_workspace(storage_dir: Path, name: str) -> Path:
             source = storage_dir / old_name
             if source.exists():
                 destination = profile_dir / new_name
-                shutil.move(str(source), destination)
                 moved.append((source, destination))
+                shutil.move(str(source), destination)
         for folder in PROFILE_FOLDERS:
             path = profile_dir / folder
             if not path.exists():

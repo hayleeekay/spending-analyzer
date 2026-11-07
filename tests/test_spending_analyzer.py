@@ -223,33 +223,39 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertFalse((rollback / "profiles").exists())
 
     def test_interrupted_legacy_conversion_rolls_back_every_move(self):
-        legacy = Path(self.temporary.name) / "interrupted-legacy"
-        (legacy / "inbox").mkdir(parents=True)
-        (legacy / "data").mkdir()
-        (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
         real_move = shutil.move
-        move_count = 0
 
-        def interrupt_second_move(source, destination):
-            nonlocal move_count
-            move_count += 1
-            if move_count == 2:
-                raise KeyboardInterrupt()
-            return real_move(source, destination)
+        for timing in ("before", "after"):
+            with self.subTest(timing=timing):
+                legacy = Path(self.temporary.name) / f"interrupted-{timing}"
+                (legacy / "inbox").mkdir(parents=True)
+                (legacy / "data").mkdir()
+                (legacy / "inbox/sample.csv").write_text("fictional", encoding="utf-8")
+                move_count = 0
 
-        with patch(
-            "spending_analyzer.workspaces.shutil.move",
-            side_effect=interrupt_second_move,
-        ):
-            with self.assertRaises(KeyboardInterrupt):
-                analyzer.migrate_legacy_workspace(legacy, "alex")
-        self.assertTrue((legacy / "inbox/sample.csv").exists())
-        self.assertTrue((legacy / "data").is_dir())
-        self.assertFalse((legacy / "profiles").exists())
+                def interrupt_second_move(source, destination):
+                    nonlocal move_count
+                    move_count += 1
+                    if move_count == 2 and timing == "before":
+                        raise KeyboardInterrupt()
+                    result = real_move(source, destination)
+                    if move_count == 2 and timing == "after":
+                        raise KeyboardInterrupt()
+                    return result
 
-        profile = analyzer.migrate_legacy_workspace(legacy, "alex")
-        self.assertTrue((profile / "imports/sample.csv").exists())
-        self.assertTrue((profile / "data").is_dir())
+                with patch(
+                    "spending_analyzer.workspaces.shutil.move",
+                    side_effect=interrupt_second_move,
+                ):
+                    with self.assertRaises(KeyboardInterrupt):
+                        analyzer.migrate_legacy_workspace(legacy, "alex")
+                self.assertTrue((legacy / "inbox/sample.csv").exists())
+                self.assertTrue((legacy / "data").is_dir())
+                self.assertFalse((legacy / "profiles").exists())
+
+                profile = analyzer.migrate_legacy_workspace(legacy, "alex")
+                self.assertTrue((profile / "imports/sample.csv").exists())
+                self.assertTrue((profile / "data").is_dir())
 
     def test_public_process_rejects_legacy_workspace_before_creating_folders(self):
         legacy = Path(self.temporary.name) / "old-api"
