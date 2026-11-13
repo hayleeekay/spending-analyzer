@@ -547,9 +547,14 @@ class SpendingAnalyzerTest(unittest.TestCase):
                 "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
             }],
         )
+        source_hash = analyzer.sha256_file(source_path)
+
+        def leave_partial_archive(_source, destination):
+            Path(destination).write_text("partial", encoding="utf-8")
+            raise OSError("archive failed")
 
         with (
-            patch("spending_analyzer.application.shutil.move", side_effect=OSError("archive failed")),
+            patch("spending_analyzer.application.shutil.copy2", side_effect=leave_partial_archive),
             patch("sys.stderr"),
         ):
             self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
@@ -558,11 +563,15 @@ class SpendingAnalyzerTest(unittest.TestCase):
         imports = json.loads((self.root / "data/imports.json").read_text())
         self.assertEqual(len(imports), 1)
         self.assertTrue(source_path.exists())
+        self.assertEqual(len(list((self.root / "data/pending-imports").glob("*.json"))), 1)
+        self.assertFalse((self.root / imports[0]["archived_path"]).exists())
         self.assertFalse((self.root / "reports/2026-07/spending-report.html").exists())
 
         self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
         self.assertFalse(source_path.exists())
-        self.assertTrue((self.root / imports[0]["archived_path"]).exists())
+        archived = self.root / imports[0]["archived_path"]
+        self.assertEqual(analyzer.sha256_file(archived), source_hash)
+        self.assertEqual(list((self.root / "data/pending-imports").glob("*.json")), [])
         self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
         self.assertEqual(len(json.loads((self.root / "data/imports.json").read_text())), 1)
 
@@ -582,24 +591,27 @@ class SpendingAnalyzerTest(unittest.TestCase):
                 analyzer.process(self.root, non_interactive=True)
 
         self.assertTrue(source_path.exists())
+        self.assertEqual(len(list((self.root / "data/pending-imports").glob("*.json"))), 1)
         self.assertEqual(list((self.root / "archive").rglob("*.csv")), [])
         self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
         self.assertFalse(source_path.exists())
         self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
 
     def test_partial_year_save_is_filled_in_without_duplicates_on_retry(self):
-        source_path = self.imports / "discover.csv"
+        source_path = self.imports / "Chase1234.csv"
         write_csv(
             source_path,
-            list(analyzer.PROVIDER_HEADERS["discover"]),
+            list(analyzer.PROVIDER_HEADERS["chase_checking"]),
             [
                 {
-                    "Trans. Date": "12/31/2025", "Post Date": "01/01/2026",
-                    "Description": "FIRST", "Amount": "10.00", "Category": "Shopping",
+                    "Details": "CREDIT", "Posting Date": "12/31/2025",
+                    "Description": "FIRST", "Amount": "10.00", "Type": "DEPOSIT",
+                    "Balance": "10.00", "Check or Slip #": "",
                 },
                 {
-                    "Trans. Date": "01/02/2026", "Post Date": "01/03/2026",
-                    "Description": "SECOND", "Amount": "20.00", "Category": "Shopping",
+                    "Details": "CREDIT", "Posting Date": "01/02/2026",
+                    "Description": "SECOND", "Amount": "20.00", "Type": "DEPOSIT",
+                    "Balance": "30.00", "Check or Slip #": "",
                 },
             ],
         )
@@ -613,16 +625,166 @@ class SpendingAnalyzerTest(unittest.TestCase):
             patch("spending_analyzer.application.save_year_shards", side_effect=save_one_then_fail),
             patch("sys.stderr"),
         ):
-            with self.assertRaisesRegex(OSError, "disk full"):
-                analyzer.process(self.root, non_interactive=True)
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
 
         self.assertTrue(source_path.exists())
         self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+        analyzer.save_json(
+            self.root / "rules/settings.json",
+            {"incoming_checking_kinds": {"deposit": "income"}},
+        )
         self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
         transactions = analyzer.load_year_shards(self.root / "data/transactions")
         self.assertEqual(len(transactions), 2)
         self.assertEqual(len({transaction["id"] for transaction in transactions}), 2)
+        self.assertEqual({transaction["kind"] for transaction in transactions}, {"reimbursement"})
         self.assertEqual(len(json.loads((self.root / "data/imports.json").read_text())), 1)
+
+    def test_history_write_failure_stops_queue_and_recovers_before_duplicate(self):
+        row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+        }
+        first = self.imports / "a.csv"
+        second = self.imports / "b.csv"
+        write_csv(first, list(analyzer.PROVIDER_HEADERS["discover"]), [row])
+        shutil.copy2(first, second)
+        real_save_json = analyzer.save_json
+        failed_once = False
+
+        def fail_first_history_write(path, value):
+            nonlocal failed_once
+            if Path(path).name == "imports.json" and not failed_once:
+                failed_once = True
+                raise OSError("history unavailable")
+            real_save_json(path, value)
+
+        with (
+            patch("spending_analyzer.application.save_json", side_effect=fail_first_history_write),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertEqual(len(list((self.root / "data/pending-imports").glob("*.json"))), 1)
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+        imports = json.loads((self.root / "data/imports.json").read_text())
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(len(list((self.root / "archive/duplicates").glob("*.csv"))), 1)
+
+    def test_external_source_restores_incomplete_known_archive(self):
+        external = Path(self.temporary.name) / "external"
+        source = external / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        source_hash = analyzer.sha256_file(source)
+        self.assertEqual(
+            analyzer.process(self.root, non_interactive=True, external_import_source=external), 0,
+        )
+        import_record = json.loads((self.root / "data/imports.json").read_text())[0]
+        archived = self.root / import_record["archived_path"]
+        archived.write_text("partial archive", encoding="utf-8")
+
+        self.assertEqual(
+            analyzer.process(self.root, non_interactive=True, external_import_source=external), 0,
+        )
+        self.assertTrue(source.exists())
+        self.assertEqual(analyzer.sha256_file(archived), source_hash)
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+
+    def test_external_source_can_restore_missing_pending_source(self):
+        external = Path(self.temporary.name) / "external"
+        source = external / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        real_copy = shutil.copy2
+
+        def fail_archive_copy(copy_source, destination):
+            if "archive" in Path(destination).parts:
+                Path(destination).write_text("partial", encoding="utf-8")
+                raise OSError("archive unavailable")
+            return real_copy(copy_source, destination)
+
+        with (
+            patch("spending_analyzer.application.shutil.copy2", side_effect=fail_archive_copy),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(
+                analyzer.process(self.root, non_interactive=True, external_import_source=external), 1,
+            )
+
+        local_source = self.imports / "discover.csv"
+        self.assertTrue(local_source.exists())
+        local_source.unlink()
+        self.assertEqual(
+            analyzer.process(self.root, non_interactive=True, external_import_source=external), 0,
+        )
+        import_record = json.loads((self.root / "data/imports.json").read_text())[0]
+        self.assertEqual(
+            analyzer.sha256_file(self.root / import_record["archived_path"]),
+            analyzer.sha256_file(source),
+        )
+        self.assertEqual(list((self.root / "data/pending-imports").glob("*.json")), [])
+
+    def test_archive_symlink_cannot_leave_profile(self):
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        archive = self.root / "archive"
+        archive.mkdir(parents=True)
+        (archive / "discover").symlink_to(outside, target_is_directory=True)
+        source = self.imports / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+
+        with patch("sys.stderr"):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertTrue(source.exists())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(analyzer.load_year_shards(self.root / "data/transactions"), [])
+
+    def test_duplicate_archive_symlink_cannot_leave_profile(self):
+        source = self.imports / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        original = source.read_bytes()
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        source.write_bytes(original)
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (self.root / "archive/duplicates").symlink_to(outside, target_is_directory=True)
+
+        with patch("sys.stderr"):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertTrue(source.exists())
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_unsupported_transaction_type_stays_unresolved_and_does_not_refresh_reports(self):
         report_path = self.root / "reports/2026-07/spending-report.html"
@@ -645,7 +807,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertIn("Unsupported Chase credit transaction type 'FEE'", stderr.getvalue())
         self.assertTrue(source_path.exists())
         self.assertEqual(analyzer.load_year_shards(self.root / "data/transactions"), [])
-        self.assertEqual(json.loads((self.root / "data/imports.json").read_text()), [])
+        self.assertEqual(analyzer.load_json(self.root / "data/imports.json", []), [])
         self.assertEqual(report_path.read_text(encoding="utf-8"), "existing report")
 
     def test_rule_application_does_not_use_bank_category(self):
@@ -672,6 +834,20 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(analyzer.classify_kind("chase_checking", p2p, analyzer.money("10"), settings), "income")
         self.assertEqual(analyzer.classify_kind("chase_checking", deposit, analyzer.money("10"), settings), "income")
         self.assertEqual(analyzer.classify_kind("chase_checking", p2p, analyzer.money("10")), "reimbursement")
+        unknown_credit = {
+            "Details": "CREDIT", "Description": "FICTIONAL CREDIT", "Type": "FUTURE_TYPE",
+        }
+        unknown_debit = {
+            "Details": "DEBIT", "Description": "FICTIONAL DEBIT", "Type": "FUTURE_TYPE",
+        }
+        self.assertEqual(
+            analyzer.classify_kind("chase_checking", unknown_credit, analyzer.money("10"), settings),
+            "reimbursement",
+        )
+        self.assertEqual(
+            analyzer.classify_kind("chase_checking", unknown_debit, analyzer.money("-10"), settings),
+            "expense",
+        )
 
     def test_other_people_comparison_uses_people_and_configured_categories(self):
         transactions = [

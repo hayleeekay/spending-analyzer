@@ -40,6 +40,128 @@ from .storage import (
 )
 from .workspaces import LegacyWorkspaceError
 
+
+def _require_profile_path(root: Path, path: Path) -> Path:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    if resolved_path == resolved_root or resolved_root not in resolved_path.parents:
+        raise ValueError(f"Managed file path leaves the profile folder: {path}")
+    return path
+
+
+def _unique_profile_destination(root: Path, directory: Path, name: str) -> Path:
+    _require_profile_path(root, directory / name)
+    destination = unique_destination(directory, name)
+    return _require_profile_path(root, destination)
+
+
+def _recorded_archive_path(root: Path, import_record: dict[str, Any]) -> Path:
+    relative = Path(str(import_record.get("archived_path", "")))
+    if relative.is_absolute() or not relative.parts or relative.parts[0] != "archive" or ".." in relative.parts:
+        raise ValueError(f"Invalid archived path in import history: {relative}")
+    return _require_profile_path(root, root / relative)
+
+
+def _file_matches(path: Path, expected_hash: str) -> bool:
+    return path.is_file() and sha256_file(path) == expected_hash
+
+
+def _archive_source(root: Path, source: Path, destination: Path, expected_hash: str) -> None:
+    _require_profile_path(root, destination)
+    if not _file_matches(source, expected_hash):
+        raise OSError(f"Import source is missing or changed: {source.name}")
+    if _file_matches(destination, expected_hash):
+        source.unlink()
+        return
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _require_profile_path(root, destination)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False,
+    ) as temporary_handle:
+        temporary = Path(temporary_handle.name)
+    try:
+        shutil.copy2(source, temporary)
+        if not _file_matches(temporary, expected_hash):
+            raise OSError(f"Archived copy did not match its source: {source.name}")
+        temporary.replace(destination)
+        if not _file_matches(destination, expected_hash):
+            raise OSError(f"Archived copy could not be verified: {source.name}")
+        source.unlink()
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _find_import_source(imports_dir: Path, source_name: str, expected_hash: str) -> Path | None:
+    preferred = imports_dir / source_name
+    candidates = [preferred] + [
+        path for path in sorted(imports_dir.glob("*.csv")) if path != preferred
+    ]
+    return next((path for path in candidates if _file_matches(path, expected_hash)), None)
+
+
+def _merge_staged_import(
+    pending: dict[str, Any], existing: dict[str, dict[str, Any]],
+    imports: list[dict[str, Any]], imports_by_hash: dict[str, dict[str, Any]],
+    transaction_dir: Path, import_path: Path,
+) -> None:
+    for staged in pending["transactions"]:
+        current = existing.get(staged["id"])
+        if current is None:
+            existing[staged["id"]] = staged
+            continue
+        sources = current.setdefault("source_files", [])
+        for source_name in staged.get("source_files", []):
+            if source_name not in sources:
+                sources.append(source_name)
+
+    import_record = pending["import_record"]
+    file_hash = pending["sha256"]
+    if file_hash not in imports_by_hash:
+        imports.append(import_record)
+        imports_by_hash[file_hash] = import_record
+    save_year_shards(transaction_dir, list(existing.values()))
+    save_json(import_path, imports)
+
+
+def _finish_pending_import(
+    root: Path, imports_dir: Path, pending_path: Path,
+    existing: dict[str, dict[str, Any]], imports: list[dict[str, Any]],
+    imports_by_hash: dict[str, dict[str, Any]], transaction_dir: Path, import_path: Path,
+) -> dict[str, Any]:
+    pending = load_json(pending_path, {})
+    file_hash = pending.get("sha256", "")
+    if not file_hash or not isinstance(pending.get("transactions"), list):
+        raise ValueError(f"Invalid pending import record: {pending_path.name}")
+    _merge_staged_import(
+        pending, existing, imports, imports_by_hash, transaction_dir, import_path,
+    )
+    import_record = pending["import_record"]
+    destination = _recorded_archive_path(root, import_record)
+    source = _find_import_source(imports_dir, pending["source_name"], file_hash)
+    if _file_matches(destination, file_hash):
+        if source is not None:
+            source.unlink()
+    elif source is not None:
+        _archive_source(root, source, destination, file_hash)
+    else:
+        raise OSError(
+            f"The original for pending import {pending['source_name']} is missing. "
+            "Put that CSV back in the Import folder or provide it with --import-from."
+        )
+    pending_path.unlink()
+    return import_record
+
+
+def _archive_is_complete(root: Path, import_record: dict[str, Any]) -> bool:
+    try:
+        return _file_matches(
+            _recorded_archive_path(root, import_record), import_record["sha256"],
+        )
+    except (KeyError, OSError, ValueError):
+        return False
+
+
 def process(
     root: Path,
     non_interactive: bool,
@@ -60,6 +182,7 @@ def process(
     rules_dir = root / "rules"
     reports_dir = root / "reports"
     for directory in (imports_dir, archive_dir, data_dir, rules_dir, reports_dir):
+        _require_profile_path(root, directory / ".profile-path-check")
         directory.mkdir(parents=True, exist_ok=True)
 
     if profile_name:
@@ -74,14 +197,23 @@ def process(
     settings_path = rules_dir / "settings.json"
     transaction_dir = data_dir / "transactions"
     decision_dir = data_dir / "decisions"
+    pending_dir = data_dir / "pending-imports"
+    _require_profile_path(root, pending_dir / ".profile-path-check")
+    pending_dir.mkdir(parents=True, exist_ok=True)
     transactions = load_year_shards(transaction_dir)
     for transaction in transactions:
         transaction["identifier"] = clean_identifier_value(transaction["provider"], transaction["identifier"])
     imports = load_json(import_path, [])
     known_files = {item["sha256"] for item in imports}
     imports_by_hash = {item["sha256"]: item for item in imports}
+    pending_paths = sorted(pending_dir.glob("*.json"))
+    pending_by_hash: dict[str, dict[str, Any]] = {}
+    for pending_path in pending_paths:
+        pending = load_json(pending_path, {})
+        if pending.get("sha256"):
+            pending_by_hash[pending["sha256"]] = pending
     if external_import_source:
-        pending_hashes = {
+        queued_hashes = {
             sha256_file(path)
             for path in imports_dir.iterdir()
             if path.is_file() and path.suffix.lower() == ".csv"
@@ -91,10 +223,16 @@ def process(
             if not source.is_file() or source.suffix.lower() != ".csv":
                 continue
             source_hash = sha256_file(source)
-            if source_hash in known_files or source_hash in pending_hashes:
+            recovery_record = imports_by_hash.get(source_hash)
+            if recovery_record is None and source_hash in pending_by_hash:
+                recovery_record = pending_by_hash[source_hash].get("import_record")
+            archive_complete = bool(
+                recovery_record and _archive_is_complete(root, recovery_record)
+            )
+            if source_hash in queued_hashes or archive_complete:
                 already_seen += 1
                 continue
-            destination = unique_destination(imports_dir, source.name)
+            destination = _unique_profile_destination(root, imports_dir, source.name)
             with tempfile.NamedTemporaryFile(
                 dir=imports_dir, prefix=".external-import-", suffix=".tmp", delete=False,
             ) as temporary_handle:
@@ -106,7 +244,7 @@ def process(
                 temporary.replace(destination)
             finally:
                 temporary.unlink(missing_ok=True)
-            pending_hashes.add(source_hash)
+            queued_hashes.add(source_hash)
             copied += 1
         print(f"External import source: {external_import_source} (read-only)")
         print(f"External CSVs: {copied} copied, {already_seen} already known")
@@ -153,49 +291,58 @@ def process(
             f"Move them to the Import folder: {imports_dir}",
             file=sys.stderr,
         )
-    csv_paths = sorted(
-        path for path in imports_dir.iterdir()
-        if path.is_file() and path.suffix.lower() == ".csv"
-    )
-    if not csv_paths:
-        print("No new CSV files found.")
-        if not transactions:
-            print(f"Next: add bank CSV exports to {imports_dir} and run this command again.")
-            return 0
-        print("Using the existing transaction history; skipped categories can still be completed.")
-
     imported_files = duplicate_files = recovered_files = failed_files = 0
     new_transactions = repeated_transactions = 0
+    for pending_path in pending_paths:
+        try:
+            import_record = _finish_pending_import(
+                root, imports_dir, pending_path, existing, imports, imports_by_hash,
+                transaction_dir, import_path,
+            )
+            file_hash = import_record["sha256"]
+            known_files.add(file_hash)
+            recovered_files += 1
+            print(f"Completed interrupted import: {import_record['original_filename']}")
+        except Exception as exc:
+            failed_files += 1
+            print(f"ERROR: Could not recover {pending_path.name}: {exc}", file=sys.stderr)
+            break
+
+    csv_paths: list[Path] = []
+    if not failed_files:
+        csv_paths = sorted(
+            path for path in imports_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".csv"
+        )
+        if not csv_paths:
+            print("No new CSV files found.")
+            if existing:
+                print("Using the existing transaction history; skipped categories can still be completed.")
+
     for path in csv_paths:
-        file_hash = sha256_file(path)
-        if file_hash in known_files:
-            try:
+        try:
+            file_hash = sha256_file(path)
+            if file_hash in known_files:
                 import_record = imports_by_hash[file_hash]
-                recorded_path = Path(import_record["archived_path"])
-                destination = (root / recorded_path).resolve()
-                if archive_dir.resolve() not in destination.parents:
-                    raise ValueError(f"Invalid archived path in import history: {recorded_path}")
-                if destination.exists():
-                    duplicate_destination = unique_destination(archive_dir / "duplicates", path.name)
-                    shutil.move(str(path), duplicate_destination)
+                destination = _recorded_archive_path(root, import_record)
+                if _file_matches(destination, file_hash):
+                    duplicate_destination = _unique_profile_destination(
+                        root, archive_dir / "duplicates", path.name,
+                    )
+                    _archive_source(root, path, duplicate_destination, file_hash)
                     print(f"Duplicate file archived without reimporting: {path.name}")
                     duplicate_files += 1
                 else:
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(path), destination)
-                    print(f"Completed interrupted archive move: {path.name}")
+                    _archive_source(root, path, destination, file_hash)
+                    print(f"Restored missing or incomplete archive: {path.name}")
                     recovered_files += 1
-            except Exception as exc:
-                failed_files += 1
-                print(f"ERROR: Could not finish importing {path.name}: {exc}", file=sys.stderr)
-            continue
-        try:
+                continue
+
             provider, rows = read_csv(path)
             account = account_id(provider, path.name)
             occurrence: Counter[str] = Counter()
             file_new = file_repeated = 0
-            file_new_transactions: dict[str, dict[str, Any]] = {}
-            repeated_transaction_ids: list[str] = []
+            staged_transactions: list[dict[str, Any]] = []
             dates: list[str] = []
             for row in rows:
                 transaction = normalize_row(provider, account, row, path.name, settings)
@@ -203,17 +350,18 @@ def process(
                 occurrence[base] += 1
                 transaction_id = stable_hash(base, occurrence[base])
                 transaction["id"] = transaction_id
+                staged_transactions.append(transaction)
                 dates.append(transaction["date"])
                 if transaction_id in existing:
-                    repeated_transaction_ids.append(transaction_id)
                     file_repeated += 1
                 else:
-                    file_new_transactions[transaction_id] = transaction
                     file_new += 1
             start = min(dates) if dates else "empty"
             end = max(dates) if dates else "empty"
             archive_name = f"{account}_{start}_to_{end}_{file_hash[:8]}.csv"
-            destination = unique_destination(archive_dir / account, archive_name)
+            destination = _unique_profile_destination(
+                root, archive_dir / account, archive_name,
+            )
             import_record = {
                 "sha256": file_hash,
                 "original_filename": path.name,
@@ -226,18 +374,18 @@ def process(
                 "repeated_transactions": file_repeated,
                 "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
-            for transaction_id in repeated_transaction_ids:
-                sources = existing[transaction_id].setdefault("source_files", [])
-                if path.name not in sources:
-                    sources.append(path.name)
-            existing.update(file_new_transactions)
-            imports.append(import_record)
-            transactions = list(existing.values())
-            save_year_shards(transaction_dir, transactions)
-            save_json(import_path, imports)
+            pending_path = pending_dir / f"{file_hash}.json"
+            save_json(pending_path, {
+                "sha256": file_hash,
+                "source_name": path.name,
+                "transactions": staged_transactions,
+                "import_record": import_record,
+            })
+            _finish_pending_import(
+                root, imports_dir, pending_path, existing, imports, imports_by_hash,
+                transaction_dir, import_path,
+            )
             known_files.add(file_hash)
-            imports_by_hash[file_hash] = import_record
-            shutil.move(str(path), destination)
             imported_files += 1
             new_transactions += file_new
             repeated_transactions += file_repeated
@@ -245,18 +393,31 @@ def process(
         except Exception as exc:
             failed_files += 1
             print(f"ERROR: Could not import {path.name}: {exc}", file=sys.stderr)
+            break
+
+    if not failed_files:
+        for import_record in imports:
+            if _archive_is_complete(root, import_record):
+                continue
+            failed_files += 1
+            print(
+                f"ERROR: Archived original is missing or incomplete for "
+                f"{import_record.get('original_filename', 'an imported CSV')}. "
+                "Put the original CSV in the Import folder or provide it with --import-from.",
+                file=sys.stderr,
+            )
+            break
 
     transactions = list(existing.values())
-    # Persist successful imports before interactive questions so an interruption
-    # leaves their source files available for a safe retry.
-    save_year_shards(transaction_dir, transactions)
-    save_json(import_path, imports)
     if failed_files:
         print("\nProcessing stopped before categorization and report generation.")
         print(f"  Files needing attention: {failed_files}")
         print("  Existing reports were not regenerated and may not include CSVs still in the Import folder.")
         print("  Fix or remove the unresolved CSVs, then run this command again.")
         return 1
+    if not transactions:
+        print(f"Next: add bank CSV exports to {imports_dir} and run this command again.")
+        return 0
     migrated_rules = migrate_legacy_rules(rules, transactions)
     always_ask_categories = set(settings.get("always_ask_person_categories", ["Bills"]))
     category_person_defaults = settings.get("category_person_defaults", {})
