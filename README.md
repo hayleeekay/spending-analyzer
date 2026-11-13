@@ -40,7 +40,13 @@ Card payments and recognized internal transfers remain visible in Transactions b
 
 ## Setup on macOS
 
-Python 3.11 or newer is recommended.
+Python 3.11 or newer is required. Check the version before creating the virtual environment:
+
+```bash
+python3 --version
+```
+
+If that reports an older version, install a current Python release first and use its executable below. For example, the command may be named `python3.11` instead of `python3`.
 
 ```bash
 git clone https://github.com/hayleeekay/spending-analyzer.git
@@ -48,6 +54,8 @@ cd spending-analyzer
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
+
+The included `run.sh` launcher supports macOS. The Python package may be portable to other systems, but Windows setup and launcher support are not included in this release.
 
 Run the tool once. The first run asks for a profile name and creates its local folders:
 
@@ -234,7 +242,7 @@ The tests use temporary directories and fictional CSV rows. They do not touch `s
 - Incoming P2P payments and deposits are estimates until the user changes the configured policy.
 - Merchant matching is deterministic text matching, not fuzzy matching or machine learning.
 - Profiles isolate separate financial workspaces, but multiple same-provider accounts inside one profile may still need explicit account support.
-- v1 targets macOS. The Python code is portable, but a Windows launcher is not included yet.
+- The supported launcher targets macOS. Windows setup and launcher support are not included yet.
 
 ## License
 
