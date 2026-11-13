@@ -79,6 +79,7 @@ def process(
         transaction["identifier"] = clean_identifier_value(transaction["provider"], transaction["identifier"])
     imports = load_json(import_path, [])
     known_files = {item["sha256"] for item in imports}
+    imports_by_hash = {item["sha256"]: item for item in imports}
     if external_import_source:
         pending_hashes = {
             sha256_file(path)
@@ -163,14 +164,30 @@ def process(
             return 0
         print("Using the existing transaction history; skipped categories can still be completed.")
 
-    imported_files = duplicate_files = failed_files = new_transactions = repeated_transactions = 0
+    imported_files = duplicate_files = recovered_files = failed_files = 0
+    new_transactions = repeated_transactions = 0
     for path in csv_paths:
         file_hash = sha256_file(path)
         if file_hash in known_files:
-            destination = unique_destination(archive_dir / "duplicates", path.name)
-            shutil.move(str(path), destination)
-            print(f"Duplicate file archived without reimporting: {path.name}")
-            duplicate_files += 1
+            try:
+                import_record = imports_by_hash[file_hash]
+                recorded_path = Path(import_record["archived_path"])
+                destination = (root / recorded_path).resolve()
+                if archive_dir.resolve() not in destination.parents:
+                    raise ValueError(f"Invalid archived path in import history: {recorded_path}")
+                if destination.exists():
+                    duplicate_destination = unique_destination(archive_dir / "duplicates", path.name)
+                    shutil.move(str(path), duplicate_destination)
+                    print(f"Duplicate file archived without reimporting: {path.name}")
+                    duplicate_files += 1
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(path), destination)
+                    print(f"Completed interrupted archive move: {path.name}")
+                    recovered_files += 1
+            except Exception as exc:
+                failed_files += 1
+                print(f"ERROR: Could not finish importing {path.name}: {exc}", file=sys.stderr)
             continue
         try:
             provider, rows = read_csv(path)
@@ -209,14 +226,18 @@ def process(
                 "repeated_transactions": file_repeated,
                 "processed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
-            shutil.move(str(path), destination)
             for transaction_id in repeated_transaction_ids:
                 sources = existing[transaction_id].setdefault("source_files", [])
                 if path.name not in sources:
                     sources.append(path.name)
             existing.update(file_new_transactions)
             imports.append(import_record)
+            transactions = list(existing.values())
+            save_year_shards(transaction_dir, transactions)
+            save_json(import_path, imports)
             known_files.add(file_hash)
+            imports_by_hash[file_hash] = import_record
+            shutil.move(str(path), destination)
             imported_files += 1
             new_transactions += file_new
             repeated_transactions += file_repeated
@@ -227,9 +248,15 @@ def process(
 
     transactions = list(existing.values())
     # Persist successful imports before interactive questions so an interruption
-    # never loses transactions whose source files have already been archived.
+    # leaves their source files available for a safe retry.
     save_year_shards(transaction_dir, transactions)
     save_json(import_path, imports)
+    if failed_files:
+        print("\nProcessing stopped before categorization and report generation.")
+        print(f"  Files needing attention: {failed_files}")
+        print("  Existing reports were not regenerated and may not include CSVs still in the Import folder.")
+        print("  Fix or remove the unresolved CSVs, then run this command again.")
+        return 1
     migrated_rules = migrate_legacy_rules(rules, transactions)
     always_ask_categories = set(settings.get("always_ask_person_categories", ["Bills"]))
     category_person_defaults = settings.get("category_person_defaults", {})
@@ -312,6 +339,7 @@ def process(
     print("\nProcessing complete")
     print(f"  Files imported: {imported_files}")
     print(f"  Duplicate files skipped: {duplicate_files}")
+    print(f"  Interrupted imports completed: {recovered_files}")
     print(f"  Files with errors (left in Import folder): {failed_files}")
     print(f"  New transactions: {new_transactions}")
     print(f"  Repeated transaction rows merged: {repeated_transactions}")
@@ -334,4 +362,4 @@ def process(
         print(f"  Net spending: ${summary['net_spending']:,.2f}")
         print(f"  Uncategorized expenses/refunds: {summary['uncategorized_count']}")
         print(f"  Reports: {reports_dir / latest}")
-    return 1 if failed_files else 0
+    return 0

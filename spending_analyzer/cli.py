@@ -143,7 +143,7 @@ Run "spending-analyzer help" or "spending-analyzer --help" to see this guide.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
-        print("\nStopped. Files already archived were imported safely; run again to continue.", file=sys.stderr)
+        print("\nStopped. Completed work was saved when possible; run again to continue.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

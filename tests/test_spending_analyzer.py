@@ -1,4 +1,5 @@
 import csv
+from io import StringIO
 import json
 import shlex
 import shutil
@@ -536,7 +537,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual([item["original_filename"] for item in imports], ["initial.csv"])
         self.assertTrue(failed_path.exists())
 
-    def test_archive_failure_does_not_commit_staged_transactions(self):
+    def test_archive_failure_is_completed_safely_on_retry(self):
         source_path = self.imports / "discover.csv"
         write_csv(
             source_path,
@@ -553,9 +554,99 @@ class SpendingAnalyzerTest(unittest.TestCase):
         ):
             self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
 
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+        imports = json.loads((self.root / "data/imports.json").read_text())
+        self.assertEqual(len(imports), 1)
+        self.assertTrue(source_path.exists())
+        self.assertFalse((self.root / "reports/2026-07/spending-report.html").exists())
+
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertFalse(source_path.exists())
+        self.assertTrue((self.root / imports[0]["archived_path"]).exists())
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+        self.assertEqual(len(json.loads((self.root / "data/imports.json").read_text())), 1)
+
+    def test_interrupted_persistence_keeps_source_available_for_retry(self):
+        source_path = self.imports / "discover.csv"
+        write_csv(
+            source_path,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+
+        with patch("spending_analyzer.application.save_year_shards", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.process(self.root, non_interactive=True)
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(list((self.root / "archive").rglob("*.csv")), [])
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertFalse(source_path.exists())
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+
+    def test_partial_year_save_is_filled_in_without_duplicates_on_retry(self):
+        source_path = self.imports / "discover.csv"
+        write_csv(
+            source_path,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [
+                {
+                    "Trans. Date": "12/31/2025", "Post Date": "01/01/2026",
+                    "Description": "FIRST", "Amount": "10.00", "Category": "Shopping",
+                },
+                {
+                    "Trans. Date": "01/02/2026", "Post Date": "01/03/2026",
+                    "Description": "SECOND", "Amount": "20.00", "Category": "Shopping",
+                },
+            ],
+        )
+
+        def save_one_then_fail(directory, records):
+            first = records[0]
+            analyzer.save_json(directory / f"{first['date'][:4]}.json", [first])
+            raise OSError("disk full")
+
+        with (
+            patch("spending_analyzer.application.save_year_shards", side_effect=save_one_then_fail),
+            patch("sys.stderr"),
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                analyzer.process(self.root, non_interactive=True)
+
+        self.assertTrue(source_path.exists())
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        transactions = analyzer.load_year_shards(self.root / "data/transactions")
+        self.assertEqual(len(transactions), 2)
+        self.assertEqual(len({transaction["id"] for transaction in transactions}), 2)
+        self.assertEqual(len(json.loads((self.root / "data/imports.json").read_text())), 1)
+
+    def test_unsupported_transaction_type_stays_unresolved_and_does_not_refresh_reports(self):
+        report_path = self.root / "reports/2026-07/spending-report.html"
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text("existing report", encoding="utf-8")
+        source_path = self.imports / "chase.csv"
+        write_csv(
+            source_path,
+            list(analyzer.PROVIDER_HEADERS["chase_credit"]),
+            [{
+                "Transaction Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "ACCOUNT FEE", "Category": "Fees", "Type": "FEE",
+                "Amount": "-10.00", "Memo": "",
+            }],
+        )
+
+        with patch("sys.stderr", new_callable=StringIO) as stderr:
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertIn("Unsupported Chase credit transaction type 'FEE'", stderr.getvalue())
+        self.assertTrue(source_path.exists())
         self.assertEqual(analyzer.load_year_shards(self.root / "data/transactions"), [])
         self.assertEqual(json.loads((self.root / "data/imports.json").read_text()), [])
-        self.assertTrue(source_path.exists())
+        self.assertEqual(report_path.read_text(encoding="utf-8"), "existing report")
 
     def test_rule_application_does_not_use_bank_category(self):
         transaction = {
