@@ -548,10 +548,13 @@ class SpendingAnalyzerTest(unittest.TestCase):
             }],
         )
         source_hash = analyzer.sha256_file(source_path)
+        real_copy = shutil.copy2
 
-        def leave_partial_archive(_source, destination):
-            Path(destination).write_text("partial", encoding="utf-8")
-            raise OSError("archive failed")
+        def leave_partial_archive(copy_source, destination):
+            if "archive" in Path(destination).parts:
+                Path(destination).write_text("partial", encoding="utf-8")
+                raise OSError("archive failed")
+            return real_copy(copy_source, destination)
 
         with (
             patch("spending_analyzer.application.shutil.copy2", side_effect=leave_partial_archive),
@@ -739,6 +742,162 @@ class SpendingAnalyzerTest(unittest.TestCase):
             analyzer.sha256_file(source),
         )
         self.assertEqual(list((self.root / "data/pending-imports").glob("*.json")), [])
+
+    def test_staged_rows_and_hash_come_from_same_snapshot(self):
+        source = self.imports / "discover.csv"
+        headers = list(analyzer.PROVIDER_HEADERS["discover"])
+        original_row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "ORIGINAL", "Amount": "10.00", "Category": "Shopping",
+        }
+        replacement_row = original_row | {"Description": "REPLACEMENT", "Amount": "999.99"}
+        write_csv(source, headers, [original_row])
+        original = source.read_bytes()
+        real_read_csv = analyzer.read_csv
+
+        def replace_before_parse(snapshot):
+            write_csv(source, headers, [replacement_row])
+            return real_read_csv(snapshot)
+
+        with (
+            patch("spending_analyzer.application.read_csv", side_effect=replace_before_parse),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        source.write_bytes(original)
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        transactions = analyzer.load_year_shards(self.root / "data/transactions")
+        self.assertEqual(len(transactions), 1)
+        self.assertEqual(transactions[0]["description"], "ORIGINAL")
+        self.assertEqual(transactions[0]["raw_amount"], "10.00")
+
+    def test_archive_cleanup_does_not_delete_replacement_source(self):
+        source = self.imports / "discover.csv"
+        headers = list(analyzer.PROVIDER_HEADERS["discover"])
+        original_row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "ORIGINAL", "Amount": "10.00", "Category": "Shopping",
+        }
+        replacement_row = original_row | {"Description": "REPLACEMENT", "Amount": "20.00"}
+        write_csv(source, headers, [original_row])
+        real_copy = shutil.copy2
+
+        def replace_after_archive_copy(copy_source, destination):
+            result = real_copy(copy_source, destination)
+            if "archive" in Path(destination).parts:
+                write_csv(source, headers, [replacement_row])
+            return result
+
+        with patch(
+            "spending_analyzer.application.shutil.copy2",
+            side_effect=replace_after_archive_copy,
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+
+        self.assertTrue(source.exists())
+        first_run = analyzer.load_year_shards(self.root / "data/transactions")
+        self.assertEqual([item["description"] for item in first_run], ["ORIGINAL"])
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        transactions = analyzer.load_year_shards(self.root / "data/transactions")
+        self.assertEqual(
+            {item["description"] for item in transactions}, {"ORIGINAL", "REPLACEMENT"},
+        )
+
+    def test_pending_archive_symlink_cannot_alias_import_source(self):
+        source = self.imports / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        real_copy = shutil.copy2
+
+        def fail_archive_copy(copy_source, destination):
+            if "archive" in Path(destination).parts:
+                raise OSError("archive unavailable")
+            return real_copy(copy_source, destination)
+
+        with (
+            patch("spending_analyzer.application.shutil.copy2", side_effect=fail_archive_copy),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        import_record = json.loads((self.root / "data/imports.json").read_text())[0]
+        destination = self.root / import_record["archived_path"]
+        destination.symlink_to(source)
+        with patch("sys.stderr"):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+        self.assertTrue(source.exists())
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(len(list((self.root / "data/pending-imports").glob("*.json"))), 1)
+
+    def test_pending_recovery_accepts_renamed_uppercase_csv(self):
+        source = self.imports / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        real_copy = shutil.copy2
+
+        def fail_archive_copy(copy_source, destination):
+            if "archive" in Path(destination).parts:
+                raise OSError("archive unavailable")
+            return real_copy(copy_source, destination)
+
+        with (
+            patch("spending_analyzer.application.shutil.copy2", side_effect=fail_archive_copy),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        restored = source.with_name("RESTORED.CSV")
+        source.replace(restored)
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertFalse(restored.exists())
+        self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
+
+    def test_interrupted_duplicate_archive_reuses_published_copy(self):
+        source = self.imports / "original.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        original = source.read_bytes()
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        duplicate = self.imports / "extra.csv"
+        duplicate.write_bytes(original)
+        real_unlink = Path.unlink
+
+        def interrupt_source_cleanup(path, *args, **kwargs):
+            if path == duplicate:
+                raise KeyboardInterrupt()
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", interrupt_source_cleanup):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.process(self.root, non_interactive=True)
+
+        self.assertTrue(duplicate.exists())
+        self.assertTrue((self.root / "archive/duplicates/extra.csv").exists())
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertFalse(duplicate.exists())
+        duplicate_names = sorted(
+            path.name for path in (self.root / "archive/duplicates").glob("*.csv")
+        )
+        self.assertEqual(duplicate_names, ["extra.csv"])
 
     def test_archive_symlink_cannot_leave_profile(self):
         outside = Path(self.temporary.name) / "outside"

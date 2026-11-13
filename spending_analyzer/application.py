@@ -55,27 +55,77 @@ def _unique_profile_destination(root: Path, directory: Path, name: str) -> Path:
     return _require_profile_path(root, destination)
 
 
+def _require_archive_path(root: Path, path: Path) -> Path:
+    _require_profile_path(root, path)
+    archive_root = (root / "archive").resolve()
+    resolved = path.resolve()
+    if path.is_symlink() or resolved == archive_root or archive_root not in resolved.parents:
+        raise ValueError(f"Managed archive path leaves the archive folder: {path}")
+    return path
+
+
+def _unique_archive_destination(root: Path, directory: Path, name: str) -> Path:
+    _require_archive_path(root, directory / name)
+    destination = unique_destination(directory, name)
+    return _require_archive_path(root, destination)
+
+
 def _recorded_archive_path(root: Path, import_record: dict[str, Any]) -> Path:
     relative = Path(str(import_record.get("archived_path", "")))
-    if relative.is_absolute() or not relative.parts or relative.parts[0] != "archive" or ".." in relative.parts:
+    if (
+        relative.is_absolute() or not relative.parts
+        or relative.parts[0] != "archive" or ".." in relative.parts
+    ):
         raise ValueError(f"Invalid archived path in import history: {relative}")
-    return _require_profile_path(root, root / relative)
+    return _require_archive_path(root, root / relative)
 
 
 def _file_matches(path: Path, expected_hash: str) -> bool:
     return path.is_file() and sha256_file(path) == expected_hash
 
 
+def _file_fingerprint(path: Path) -> tuple[int, int, int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+
+
+def _snapshot_csv(source: Path, pending_dir: Path) -> tuple[Path, str]:
+    with tempfile.NamedTemporaryFile(
+        dir=pending_dir, prefix=".source-", suffix=".tmp", delete=False,
+    ) as temporary_handle:
+        snapshot = Path(temporary_handle.name)
+    try:
+        shutil.copy2(source, snapshot)
+        snapshot_hash = sha256_file(snapshot)
+        if not _file_matches(source, snapshot_hash):
+            raise OSError(f"Import source changed while it was being read: {source.name}")
+        return snapshot, snapshot_hash
+    except BaseException:
+        snapshot.unlink(missing_ok=True)
+        raise
+
+
+def _remove_source_if_unchanged(
+    source: Path, fingerprint: tuple[int, int, int, int], expected_hash: str,
+) -> None:
+    try:
+        if _file_fingerprint(source) == fingerprint and _file_matches(source, expected_hash):
+            source.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _archive_source(root: Path, source: Path, destination: Path, expected_hash: str) -> None:
-    _require_profile_path(root, destination)
+    _require_archive_path(root, destination)
     if not _file_matches(source, expected_hash):
         raise OSError(f"Import source is missing or changed: {source.name}")
+    source_fingerprint = _file_fingerprint(source)
     if _file_matches(destination, expected_hash):
-        source.unlink()
+        _remove_source_if_unchanged(source, source_fingerprint, expected_hash)
         return
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    _require_profile_path(root, destination)
+    _require_archive_path(root, destination)
     with tempfile.NamedTemporaryFile(
         dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False,
     ) as temporary_handle:
@@ -87,7 +137,7 @@ def _archive_source(root: Path, source: Path, destination: Path, expected_hash: 
         temporary.replace(destination)
         if not _file_matches(destination, expected_hash):
             raise OSError(f"Archived copy could not be verified: {source.name}")
-        source.unlink()
+        _remove_source_if_unchanged(source, source_fingerprint, expected_hash)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -95,9 +145,19 @@ def _archive_source(root: Path, source: Path, destination: Path, expected_hash: 
 def _find_import_source(imports_dir: Path, source_name: str, expected_hash: str) -> Path | None:
     preferred = imports_dir / source_name
     candidates = [preferred] + [
-        path for path in sorted(imports_dir.glob("*.csv")) if path != preferred
+        path for path in sorted(imports_dir.iterdir())
+        if path.is_file() and path.suffix.lower() == ".csv" and path != preferred
     ]
     return next((path for path in candidates if _file_matches(path, expected_hash)), None)
+
+
+def _duplicate_archive_destination(
+    root: Path, directory: Path, name: str, expected_hash: str,
+) -> Path:
+    candidate = directory / name
+    if _file_matches(candidate, expected_hash):
+        return _require_archive_path(root, candidate)
+    return _unique_archive_destination(root, directory, name)
 
 
 def _merge_staged_import(
@@ -141,7 +201,7 @@ def _finish_pending_import(
     source = _find_import_source(imports_dir, pending["source_name"], file_hash)
     if _file_matches(destination, file_hash):
         if source is not None:
-            source.unlink()
+            _archive_source(root, source, destination, file_hash)
     elif source is not None:
         _archive_source(root, source, destination, file_hash)
     else:
@@ -320,14 +380,16 @@ def process(
                 print("Using the existing transaction history; skipped categories can still be completed.")
 
     for path in csv_paths:
+        snapshot: Path | None = None
         try:
-            file_hash = sha256_file(path)
+            snapshot, file_hash = _snapshot_csv(path, pending_dir)
             if file_hash in known_files:
                 import_record = imports_by_hash[file_hash]
                 destination = _recorded_archive_path(root, import_record)
                 if _file_matches(destination, file_hash):
-                    duplicate_destination = _unique_profile_destination(
-                        root, archive_dir / "duplicates", path.name,
+                    duplicate_directory = archive_dir / "duplicates"
+                    duplicate_destination = _duplicate_archive_destination(
+                        root, duplicate_directory, path.name, file_hash,
                     )
                     _archive_source(root, path, duplicate_destination, file_hash)
                     print(f"Duplicate file archived without reimporting: {path.name}")
@@ -338,7 +400,7 @@ def process(
                     recovered_files += 1
                 continue
 
-            provider, rows = read_csv(path)
+            provider, rows = read_csv(snapshot)
             account = account_id(provider, path.name)
             occurrence: Counter[str] = Counter()
             file_new = file_repeated = 0
@@ -359,7 +421,7 @@ def process(
             start = min(dates) if dates else "empty"
             end = max(dates) if dates else "empty"
             archive_name = f"{account}_{start}_to_{end}_{file_hash[:8]}.csv"
-            destination = _unique_profile_destination(
+            destination = _unique_archive_destination(
                 root, archive_dir / account, archive_name,
             )
             import_record = {
@@ -394,6 +456,9 @@ def process(
             failed_files += 1
             print(f"ERROR: Could not import {path.name}: {exc}", file=sys.stderr)
             break
+        finally:
+            if snapshot is not None:
+                snapshot.unlink(missing_ok=True)
 
     if not failed_files:
         for import_record in imports:
