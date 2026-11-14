@@ -136,26 +136,43 @@ def generate_html(
         f"<tr><td>{html.escape(person)}</td><td>${amount:,.2f}</td></tr>"
         for person, amount in sorted(summary["people_totals"].items())
     )
+    month_label = datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+    month_result = summary["net_after_spending"]
+    if month_result > 0:
+        month_result_text = f"+${month_result:,.2f}"
+        month_result_context = "More came in than went out"
+    elif month_result < 0:
+        month_result_text = f"-${abs(month_result):,.2f}"
+        month_result_context = "More went out than came in"
+    else:
+        month_result_text = "$0.00"
+        month_result_context = "Money in and out were balanced"
+    pooled_gap = max(summary["other_people_after_reimbursements"], Decimal("0"))
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Spending report {month}</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:1100px;margin:auto;padding:24px;color:#202124}}h1,h2{{margin-bottom:.4rem}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}}.card{{background:#f4f6f8;border-radius:10px;padding:16px}}.value{{font-size:1.5rem;font-weight:700}}table{{border-collapse:collapse;width:100%;margin:12px 0 28px}}th,td{{padding:8px;border-bottom:1px solid #ddd;text-align:left}}th{{background:#f4f6f8;position:sticky;top:0}}.note{{color:#5f6368}}</style></head>
-<body><h1>Spending report - {month}</h1><p class="note">Local report. Card payments and transfers are excluded from spending and income.</p>
-<div class="cards">
-<div class="card">Income<div class="value">${summary['income']:,.2f}</div></div>
-<div class="card">Estimated reimbursements<div class="value">${summary['reimbursements']:,.2f}</div></div>
-<div class="card">Spending assigned to others<div class="value">${summary['other_people_spending']:,.2f}</div></div>
-<div class="card">Others spending minus reimbursements<div class="value">${summary['other_people_after_reimbursements']:,.2f}</div></div>
-<div class="card">Gross spending<div class="value">${summary['spending']:,.2f}</div></div>
-<div class="card">Refunds/credits<div class="value">${summary['refunds']:,.2f}</div></div>
-<div class="card">Net spending<div class="value">${summary['net_spending']:,.2f}</div></div>
-<div class="card">Income + reimbursements − net spending<div class="value">${summary['net_after_spending']:,.2f}</div></div>
+<style>
+*{{box-sizing:border-box}}body{{font-family:system-ui,-apple-system,sans-serif;max-width:1100px;margin:auto;padding:32px 24px 56px;color:#3e342e;background:#fcf8f4}}header{{padding-bottom:20px;border-bottom:1px solid #e4d7cf}}h1{{margin:2px 0 6px;font-size:clamp(2rem,5vw,2.8rem);letter-spacing:-.03em}}h2{{margin:36px 0 12px;font-size:1.35rem}}.eyebrow{{margin:0;color:#9d5b47;font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}}.note,.context{{color:#786c64}}.note{{margin:0;line-height:1.5}}.cards{{display:grid;gap:12px;margin-top:16px}}.key-cards{{grid-template-columns:repeat(3,minmax(0,1fr))}}.detail-cards{{grid-template-columns:repeat(4,minmax(0,1fr));margin-top:12px}}.card{{display:flex;min-height:118px;flex-direction:column;justify-content:space-between;padding:16px;background:#fff;border:1px solid #e4d7cf;border-radius:12px}}.card.key{{color:#fff;background:#9d5b47;border-color:#9d5b47}}.card.soft{{background:#f2e4dc}}.label{{font-size:.78rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}}.value{{margin:8px 0;font-size:1.7rem;font-weight:700;font-variant-numeric:tabular-nums}}.context{{font-size:.82rem;line-height:1.35}}.key .context{{color:#f8e9e2}}.reimbursement-note{{margin-top:12px}}.table-scroll{{overflow-x:auto;margin:12px 0 30px;border:1px solid #e4d7cf;border-radius:10px;background:#fff}}table{{border-collapse:collapse;width:100%}}th,td{{padding:10px 12px;border-bottom:1px solid #e4d7cf;text-align:left}}th{{color:#fff;background:#5b514c;font-size:.82rem}}tbody tr:nth-child(even){{background:#fcf8f4}}tbody tr:last-child td{{border-bottom:0}}th:last-child,td:last-child{{text-align:right;font-variant-numeric:tabular-nums}}.transactions{{min-width:780px}}@media(max-width:760px){{body{{padding:24px 16px 44px}}.key-cards,.detail-cards{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}@media(max-width:460px){{.key-cards,.detail-cards{{grid-template-columns:1fr}}.card{{min-height:104px}}}}
+</style></head>
+<body><header><p class="eyebrow">Spending Analyzer</p><h1>{month_label} spending</h1><p class="note">Local report. Card payments and transfers are excluded from spending and income.</p></header>
+<main><h2>Month at a glance</h2>
+<div class="cards key-cards">
+<div class="card key"><div class="label">Month result</div><div class="value">{month_result_text}</div><div class="context">{month_result_context}</div></div>
+<div class="card soft"><div class="label">Income + reimbursements</div><div class="value">${summary['income'] + summary['reimbursements']:,.2f}</div><div class="context">Income ${summary['income']:,.2f} + reimbursements ${summary['reimbursements']:,.2f}</div></div>
+<div class="card soft"><div class="label">Net spending</div><div class="value">${summary['net_spending']:,.2f}</div><div class="context">Purchases ${summary['spending']:,.2f} - refunds ${summary['refunds']:,.2f}</div></div>
 </div>
-<h2>Spending by category</h2><table><thead><tr><th>Category</th><th>Amount</th></tr></thead><tbody>{category_rows}</tbody></table>
-<h2>Spending by person</h2><table><thead><tr><th>Person</th><th>Net amount</th></tr></thead><tbody>{people_rows}</tbody></table>
-<h2>Bills by responsibility</h2><table><thead><tr><th>For</th><th>Net amount</th></tr></thead><tbody>{bill_rows}</tbody></table>
-<h2>All transactions</h2><table><thead><tr><th>Date</th><th>Account</th><th>Description</th><th>Kind</th><th>Category</th><th>For</th><th>Original amount</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
-</body></html>"""
+<div class="cards detail-cards">
+<div class="card"><div class="label">Purchases</div><div class="value">${summary['spending']:,.2f}</div><div class="context">Before refunds</div></div>
+<div class="card"><div class="label">Refunds</div><div class="value">${summary['refunds']:,.2f}</div><div class="context">Credits against spending</div></div>
+<div class="card"><div class="label">Spending marked for others</div><div class="value">${summary['other_people_spending']:,.2f}</div><div class="context">Based on people and configured groups</div></div>
+<div class="card"><div class="label">Gap after pooled reimbursements</div><div class="value">${pooled_gap:,.2f}</div><div class="context">Pooled estimate, not person-matched</div></div>
+</div>
+<p class="note reimbursement-note">Month result = income + reimbursements - net spending. Reimbursements are pooled estimates and are not matched to individual people or purchases.</p>
+<h2>Spending by category</h2><div class="table-scroll"><table><thead><tr><th>Category</th><th>Amount</th></tr></thead><tbody>{category_rows}</tbody></table></div>
+<h2>Spending by person</h2><div class="table-scroll"><table><thead><tr><th>Person</th><th>Net amount</th></tr></thead><tbody>{people_rows}</tbody></table></div>
+<h2>Bills by responsibility</h2><div class="table-scroll"><table><thead><tr><th>For</th><th>Net amount</th></tr></thead><tbody>{bill_rows}</tbody></table></div>
+<h2>All transactions</h2><div class="table-scroll"><table class="transactions"><thead><tr><th>Date</th><th>Account</th><th>Description</th><th>Kind</th><th>Category</th><th>For</th><th>Original amount</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+</main></body></html>"""
     destination.write_text(document, encoding="utf-8")
 
 
