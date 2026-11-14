@@ -7,6 +7,7 @@ from copy import copy
 import csv
 from decimal import Decimal
 import html
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -390,6 +391,7 @@ def generate_xlsx(
         dashboard.cell(row, 11, float(amount))
 
     section_title("A22:H22", "Net spending by category")
+    refund_section_row = 42
     if positive_categories:
         chart = BarChart()
         chart.type = "bar"
@@ -413,30 +415,41 @@ def generate_xlsx(
         chart.height = min(13, max(8, 5 + len(positive_categories) * 0.55))
         chart.width = 22
         dashboard.add_chart(chart, "A23")
+        refund_section_row = max(42, 23 + ceil(chart.height / 0.529) + 2)
     else:
         dashboard["A24"] = "No categories had net purchases this month."
         dashboard["A24"].font = Font(italic=True, color=muted)
 
-    section_title("A42:H42", "Refund-heavy and zero categories")
-    dashboard["A43"], dashboard["B43"] = "Category", "Net amount"
-    dashboard["A43"].font = dashboard["B43"].font = Font(
-        bold=True, color=accent_dark,
-    )
-    dashboard["A43"].fill = dashboard["B43"].fill = PatternFill(
-        "solid", fgColor=pale,
+    section_title(
+        f"A{refund_section_row}:H{refund_section_row}",
+        "Refund-heavy and zero categories",
     )
     if nonpositive_categories:
-        for row, (name, amount) in enumerate(nonpositive_categories, 44):
+        header_row = refund_section_row + 1
+        dashboard.cell(header_row, 1, "Category")
+        dashboard.cell(header_row, 2, "Net amount")
+        dashboard.cell(header_row, 1).font = dashboard.cell(header_row, 2).font = Font(
+            bold=True, color=accent_dark,
+        )
+        dashboard.cell(header_row, 1).fill = dashboard.cell(header_row, 2).fill = PatternFill(
+            "solid", fgColor=pale,
+        )
+        for row, (name, amount) in enumerate(nonpositive_categories, header_row + 1):
             dashboard.cell(row, 1, name)
             dashboard.cell(row, 2, float(amount))
             dashboard.cell(row, 2).number_format = currency_format
-        nonpositive_end = 43 + len(nonpositive_categories)
+        nonpositive_end = header_row + len(nonpositive_categories)
+        border_range(dashboard, f"A{header_row}:B{nonpositive_end}")
     else:
-        dashboard["A44"] = "None"
-        dashboard["B44"] = 0
-        dashboard["B44"].number_format = currency_format
-        nonpositive_end = 44
-    border_range(dashboard, f"A43:B{nonpositive_end}")
+        nonpositive_end = refund_section_row + 1
+        dashboard.merge_cells(
+            start_row=nonpositive_end, start_column=1,
+            end_row=nonpositive_end, end_column=4,
+        )
+        dashboard.cell(nonpositive_end, 1).value = (
+            "No refund-heavy or zero categories were recorded."
+        )
+        dashboard.cell(nonpositive_end, 1).font = Font(italic=True, color=muted)
     note_row = nonpositive_end + 2
     dashboard.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=8)
     dashboard.cell(note_row, 1).value = (

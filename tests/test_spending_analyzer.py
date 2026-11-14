@@ -1366,8 +1366,40 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.addCleanup(workbook.close)
         self.assertEqual(workbook["Dashboard"]["A6"].value, 0)
         self.assertEqual(workbook["Dashboard"]["A24"].value, "No categories had net purchases this month.")
+        self.assertEqual(
+            workbook["Dashboard"]["A43"].value,
+            "No refund-heavy or zero categories were recorded.",
+        )
         self.assertEqual(workbook["Dashboard"]._charts, [])
         self.assertEqual(workbook["Transactions"].max_row, 1)
+
+    def test_excel_dashboard_places_refund_table_after_a_large_chart(self):
+        transactions = []
+        for index in range(1, 41):
+            kind = "expense" if index <= 30 else "refund"
+            transactions.append({
+                "provider": "apple", "account": "apple",
+                "date": "2026-07-01", "post_date": "2026-07-01",
+                "description": f"FICTIONAL {index}", "kind": kind,
+                "raw_amount": str(index), "category": f"Category {index:02d}",
+                "responsibility": "Primary", "identifier": f"FICTIONAL {index}",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            })
+        destination = self.root / "large-chart.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", transactions, destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        section_row = next(
+            cell.row for row in dashboard.iter_rows() for cell in row
+            if cell.value == "Refund-heavy and zero categories"
+        )
+        self.assertGreaterEqual(section_row, 50)
+        self.assertEqual(dashboard.cell(section_row + 2, 1).value, "Category 40")
 
     def test_rules_are_scoped_to_account(self):
         first = {"id": "one", "provider": "chase_credit", "account": "chase_credit-1111", "identifier": "SAMPLE MERCHANT", "kind": "expense"}
