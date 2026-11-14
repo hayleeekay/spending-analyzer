@@ -30,9 +30,9 @@ spending-data/profiles/alex/reports/YYYY-MM/
 
 The Excel workbook contains:
 
-- **Dashboard:** spending for the default person, spending assigned to others, reimbursements, income, and comparison charts.
+- **Dashboard:** a monthly brief with net spending, purchases, refunds, allocation context, estimated reimbursements, and a category comparison.
 - **Categories:** category totals, person subtotals, dated transaction detail, and a grand total.
-- **People:** compact cards showing each person or named group by category.
+- **People:** compact cards showing each person and category-only group by category.
 - **Bills:** exact dated bills grouped beneath each responsible person.
 - **Transactions:** a filterable normalized ledger. Money out is negative cash flow; money in is positive.
 

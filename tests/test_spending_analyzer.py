@@ -472,7 +472,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(workbook.sheetnames[0], "Dashboard")
         self.assertEqual(workbook.sheetnames, ["Dashboard", "Categories", "People", "Bills", "Transactions"])
         self.assertEqual(workbook["Categories"]["A1"].value, "Category / Person")
-        self.assertEqual(workbook["People"]["A1"].value, "People and groups by category")
+        self.assertEqual(workbook["People"]["A1"].value, "Spending by person")
         self.assertEqual(
             workbook["Categories"].cell(workbook["Categories"].max_row, 1).value,
             "GRAND TOTAL",
@@ -1290,6 +1290,198 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.assertEqual(transaction_values[4], "=CATEGORY")
         self.assertEqual(transaction_values[5], "=PERSON")
         self.assertEqual(transaction_values[10:13], ["=IDENTIFIER", "=BANK CATEGORY", "=BANK TYPE"])
+
+    def test_excel_dashboard_is_a_complete_monthly_brief(self):
+        def report_transaction(
+            index, kind, amount, category="Uncategorized", responsibility="",
+        ):
+            return {
+                "provider": "apple", "account": "apple",
+                "date": f"2026-07-{index:02d}", "post_date": f"2026-07-{index:02d}",
+                "description": f"FICTIONAL {index}", "kind": kind,
+                "raw_amount": str(amount), "category": category,
+                "responsibility": responsibility, "identifier": f"FICTIONAL {index}",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            }
+
+        long_category = "Household supplies and shared essentials"
+        transactions = [
+            report_transaction(1, "expense", "100", "Groceries", "Primary"),
+            report_transaction(2, "refund", "20", "Groceries", "Primary"),
+            report_transaction(3, "expense", "50", "Shopping", "Alex"),
+            report_transaction(4, "expense", "60", "Gifts", "Primary"),
+            report_transaction(5, "refund", "75", "Gifts", "Primary"),
+            report_transaction(6, "expense", "40", "Family Group"),
+            report_transaction(7, "expense", "25", long_category),
+            report_transaction(8, "expense", "30", "Activities"),
+            report_transaction(9, "expense", "10", "Transit", "Primary"),
+            report_transaction(10, "refund", "10", "Transit", "Primary"),
+            report_transaction(11, "income", "1000"),
+            report_transaction(12, "reimbursement", "60"),
+        ]
+        destination = self.root / "monthly-brief.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", transactions, destination,
+            personless_categories={"Family Group", long_category},
+            default_person="Primary", other_people_categories={"Family Group"},
+            profile_name="alex",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=False)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(dashboard["A1"].value, "July 2026 spending")
+        self.assertEqual(dashboard["H1"].value, "ALEX")
+        self.assertEqual(dashboard["A6"].value, 850)
+        self.assertEqual(dashboard["F6"].value, 1060)
+        self.assertEqual(dashboard["H6"].value, 210)
+        self.assertEqual(dashboard["F5"].value, "INCOME + REIMBURSEMENTS")
+        self.assertIn("Income $1,000.00", dashboard["F8"].value)
+        self.assertIn("reimbursements $60.00", dashboard["F8"].value)
+        self.assertEqual(
+            [dashboard[cell].value for cell in ("A12", "D12", "A16", "D16")],
+            [65, 90, 25, 30],
+        )
+        self.assertEqual([dashboard.cell(row, 10).value for row in range(11, 14)], [90, 60, 30])
+        self.assertEqual(
+            dashboard["G10"].value,
+            "Pooled reimbursements were lower than marked spending",
+        )
+        category_values = {
+            dashboard.cell(row, 12).value: dashboard.cell(row, 13).value
+            for row in range(2, 7)
+        }
+        self.assertEqual(category_values[long_category], 25)
+        self.assertIn("Gifts: -$15.00", dashboard["A36"].value)
+        self.assertIn("Transit: $0.00", dashboard["A36"].value)
+        self.assertEqual(len(dashboard._charts), 1)
+        self.assertEqual(
+            workbook.sheetnames,
+            ["Dashboard", "Categories", "People", "Bills", "Transactions"],
+        )
+
+    def test_excel_report_handles_an_empty_month(self):
+        destination = self.root / "empty-report.xlsx"
+        analyzer.generate_xlsx("2026-07", [], destination, profile_name="empty")
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        self.assertEqual(workbook["Dashboard"]["A6"].value, 0)
+        self.assertEqual(workbook["Dashboard"]["A5"].value, "MONTH RESULT · BALANCED")
+        self.assertEqual(workbook["Dashboard"]["G10"].value, "No net spending marked for other people")
+        self.assertEqual(workbook["Dashboard"]["A23"].value, "No categories had net purchases this month.")
+        self.assertEqual(
+            workbook["Dashboard"]["A36"].value,
+            "None this month.",
+        )
+        self.assertEqual(workbook["Dashboard"]._charts, [])
+        self.assertEqual(workbook["Transactions"].max_row, 1)
+
+    def test_excel_dashboard_does_not_describe_other_person_refunds_as_reimbursement(self):
+        transaction = {
+            "provider": "apple", "account": "apple", "date": "2026-07-01",
+            "post_date": "2026-07-01", "description": "FICTIONAL REFUND",
+            "kind": "refund", "raw_amount": "30", "category": "Shopping",
+            "responsibility": "Alex", "identifier": "FICTIONAL REFUND",
+            "bank_category": "Test", "bank_type": "Refund", "splits": [],
+        }
+        destination = self.root / "other-person-refund.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", [transaction], destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(
+            dashboard["G10"].value,
+            "Refunds exceeded spending marked for other people",
+        )
+        self.assertEqual([dashboard.cell(row, 10).value for row in range(11, 14)], [-30, 0, 0])
+        self.assertIn("Refunds or credits exceeded purchases", dashboard["G15"].value)
+
+    def test_excel_dashboard_summarizes_large_category_lists(self):
+        transactions = []
+        for index in range(1, 41):
+            kind = "expense" if index <= 30 else "refund"
+            transactions.append({
+                "provider": "apple", "account": "apple",
+                "date": "2026-07-01", "post_date": "2026-07-01",
+                "description": f"FICTIONAL {index}", "kind": kind,
+                "raw_amount": str(index), "category": f"Category {index:02d}",
+                "responsibility": "Primary", "identifier": f"FICTIONAL {index}",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            })
+        destination = self.root / "large-chart.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", transactions, destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(dashboard["L2"].value, "Category 30")
+        self.assertEqual(dashboard["L8"].value, "Category 24")
+        self.assertIn("23 smaller categories", dashboard["A21"].value)
+        self.assertIn("Category 40: -$40.00", dashboard["A36"].value)
+        self.assertIn("+6 more on Categories", dashboard["A36"].value)
+        self.assertEqual(len(dashboard._charts), 1)
+
+    def test_excel_dashboard_separates_a_dominant_category(self):
+        transactions = [
+            {
+                "provider": "apple", "account": "apple", "date": "2026-07-01",
+                "post_date": "2026-07-01", "description": "FICTIONAL RENT",
+                "kind": "expense", "raw_amount": "1000", "category": "Housing",
+                "responsibility": "Primary", "identifier": "FICTIONAL RENT",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            },
+            {
+                "provider": "apple", "account": "apple", "date": "2026-07-02",
+                "post_date": "2026-07-02", "description": "FICTIONAL FOOD",
+                "kind": "expense", "raw_amount": "100", "category": "Dining",
+                "responsibility": "Primary", "identifier": "FICTIONAL FOOD",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            },
+        ]
+        destination = self.root / "dominant-category.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", transactions, destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(dashboard["A23"].value, "Housing")
+        self.assertEqual(dashboard["A25"].value, 1000)
+        self.assertEqual(dashboard["L2"].value, "Dining")
+        self.assertEqual(dashboard["M2"].value, 100)
+
+    def test_excel_dashboard_handles_only_one_positive_category(self):
+        transaction = {
+            "provider": "apple", "account": "apple", "date": "2026-07-01",
+            "post_date": "2026-07-01", "description": "FICTIONAL FOOD",
+            "kind": "expense", "raw_amount": "100", "category": "Dining",
+            "responsibility": "Primary", "identifier": "FICTIONAL FOOD",
+            "bank_category": "Test", "bank_type": "Test", "splits": [],
+        }
+        destination = self.root / "one-category.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", [transaction], destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(dashboard["A23"].value, "Dining")
+        self.assertEqual(dashboard["A25"].value, 100)
+        self.assertEqual(dashboard._charts, [])
 
     def test_rules_are_scoped_to_account(self):
         first = {"id": "one", "provider": "chase_credit", "account": "chase_credit-1111", "identifier": "SAMPLE MERCHANT", "kind": "expense"}
