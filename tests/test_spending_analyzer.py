@@ -1240,6 +1240,39 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.assertEqual(summary["other_people_spending"], analyzer.money("50"))
         self.assertEqual(summary["other_people_after_reimbursements"], analyzer.money("15"))
 
+    def test_html_report_has_a_clear_responsive_monthly_summary(self):
+        transactions = [
+            {
+                "provider": "apple", "account": "apple", "date": "2026-07-01",
+                "post_date": "2026-07-01", "description": "FICTIONAL DINNER",
+                "kind": "expense", "raw_amount": "80", "category": "Dining",
+                "responsibility": "Alex", "identifier": "FICTIONAL DINNER",
+                "bank_category": "Test", "bank_type": "Purchase", "splits": [],
+            },
+            {
+                "provider": "chase_checking", "account": "chase_checking",
+                "date": "2026-07-02", "post_date": "2026-07-02",
+                "description": "FICTIONAL REPAYMENT", "kind": "reimbursement",
+                "raw_amount": "50", "category": "Uncategorized", "responsibility": "",
+                "identifier": "FICTIONAL REPAYMENT", "bank_category": "",
+                "bank_type": "QuickPay credit", "splits": [],
+            },
+        ]
+        destination = self.root / "spending-report.html"
+        analyzer.generate_html(
+            "2026-07", transactions, destination, default_person="Primary",
+        )
+
+        report = destination.read_text(encoding="utf-8")
+        self.assertIn("July 2026 spending", report)
+        self.assertIn("Month result", report)
+        self.assertIn("-$30.00", report)
+        self.assertIn("More went out than came in", report)
+        self.assertIn("Gap after pooled reimbursements", report)
+        self.assertIn("Pooled estimate, not person-matched", report)
+        self.assertIn('class="table-scroll"', report)
+        self.assertIn("@media(max-width:460px)", report)
+
     def test_excel_bills_lists_dated_bills_under_each_person(self):
         transaction = {
             "provider": "apple", "account": "apple", "date": "2026-07-10",
