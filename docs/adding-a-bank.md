@@ -25,7 +25,7 @@ Cleanup should remove changing reference text while preserving enough merchant t
 
 ## 3. Classify transaction types
 
-Add a branch to `classify_kind()`. Every row must become one of:
+Add a branch to `classify_kind()`. Every accepted row must become one of:
 
 - `expense`
 - `refund`
@@ -33,9 +33,10 @@ Add a branch to `classify_kind()`. Every row must become one of:
 - `reimbursement`
 - `card_payment`
 - `transfer`
-- `unknown`
 
 Use both the provider's documented sign convention and its transaction-type column. Do not assume positive always means income: several supported credit-card exports use positive amounts for purchases.
+
+`unknown` is an internal rejection signal, not a normalized transaction type. `normalize_row()` stops the import when it sees `unknown`, preserving the source for review until explicit provider handling is added.
 
 ## 4. Map dates and amounts
 
