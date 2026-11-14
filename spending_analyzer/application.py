@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -41,12 +43,67 @@ from .storage import (
 from .workspaces import LegacyWorkspaceError
 
 
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@contextmanager
+def _profile_lock(root: Path):
+    lock_path = root / ".spending-analyzer.lock"
+    root.mkdir(parents=True, exist_ok=True)
+    for attempt in range(2):
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError:
+            try:
+                owner = int(lock_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                owner = None
+            if attempt == 0 and owner is not None and not _pid_is_running(owner):
+                lock_path.unlink(missing_ok=True)
+                continue
+            raise RuntimeError(
+                f"Another Spending Analyzer run is using this profile. "
+                f"If no run is active, remove {lock_path}."
+            )
+    else:
+        raise RuntimeError(f"Could not lock profile: {root}")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
 def _require_profile_path(root: Path, path: Path) -> Path:
     resolved_root = root.resolve()
     resolved_path = path.resolve()
     if resolved_path == resolved_root or resolved_root not in resolved_path.parents:
         raise ValueError(f"Managed file path leaves the profile folder: {path}")
     return path
+
+
+def _prepare_managed_directories(root: Path, directories: list[Path]) -> None:
+    for directory in directories:
+        if directory.is_symlink():
+            raise ValueError(f"Managed profile folders cannot be symlinks: {directory}")
+        _require_profile_path(root, directory / ".profile-path-check")
+        directory.mkdir(parents=True, exist_ok=True)
+    resolved = [directory.resolve() for directory in directories]
+    for index, first in enumerate(resolved):
+        for second in resolved[index + 1:]:
+            if first == second or first in second.parents or second in first.parents:
+                raise ValueError("Managed profile folders must not overlap")
 
 
 def _unique_profile_destination(root: Path, directory: Path, name: str) -> Path:
@@ -84,50 +141,78 @@ def _file_matches(path: Path, expected_hash: str) -> bool:
     return path.is_file() and sha256_file(path) == expected_hash
 
 
-def _file_fingerprint(path: Path) -> tuple[int, int, int, int]:
-    status = path.stat()
-    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+def _require_claim_path(root: Path, path: Path) -> Path:
+    claims_root = (root / "data/pending-imports/claims").resolve()
+    resolved = path.resolve()
+    if path.is_symlink() or resolved == claims_root or claims_root not in resolved.parents:
+        raise ValueError(f"Invalid claimed import path: {path}")
+    return path
 
 
-def _snapshot_csv(source: Path, pending_dir: Path) -> tuple[Path, str]:
-    with tempfile.NamedTemporaryFile(
-        dir=pending_dir, prefix=".source-", suffix=".tmp", delete=False,
-    ) as temporary_handle:
-        snapshot = Path(temporary_handle.name)
+def _claim_paths(claims_dir: Path, source_name: str) -> tuple[Path, Path]:
+    claim_id = stable_hash(source_name)[:20]
+    return claims_dir / f"{claim_id}.csv", claims_dir / f"{claim_id}.json"
+
+
+def _claim_public_source(
+    root: Path, imports_dir: Path, claims_dir: Path, source: Path,
+) -> tuple[Path, Path, dict[str, Any]]:
+    if source.is_symlink() or source.parent.resolve() != imports_dir.resolve():
+        raise ValueError(f"Import sources must be regular files in the Import folder: {source}")
+    claim_path, metadata_path = _claim_paths(claims_dir, source.name)
+    _require_claim_path(root, claim_path)
+    if claim_path.exists() or metadata_path.exists():
+        raise OSError(f"An earlier import claim still needs recovery: {source.name}")
+    metadata = {
+        "source_name": source.name,
+        "claimed_name": claim_path.name,
+        "archive_path": "",
+    }
+    save_json(metadata_path, metadata)
     try:
-        shutil.copy2(source, snapshot)
-        snapshot_hash = sha256_file(snapshot)
-        if not _file_matches(source, snapshot_hash):
-            raise OSError(f"Import source changed while it was being read: {source.name}")
-        return snapshot, snapshot_hash
+        source.replace(claim_path)
     except BaseException:
-        snapshot.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
         raise
+    return claim_path, metadata_path, metadata
 
 
-def _remove_source_if_unchanged(
-    source: Path, fingerprint: tuple[int, int, int, int], expected_hash: str,
+def _restore_uncommitted_claim(
+    root: Path, imports_dir: Path, claim_path: Path, metadata_path: Path,
+    source_name: str,
 ) -> None:
-    try:
-        if _file_fingerprint(source) == fingerprint and _file_matches(source, expected_hash):
-            source.unlink()
-    except FileNotFoundError:
-        pass
+    if claim_path.exists():
+        destination = _unique_profile_destination(root, imports_dir, source_name)
+        claim_path.replace(destination)
+    metadata_path.unlink(missing_ok=True)
+
+
+def _load_claim(
+    root: Path, claims_dir: Path, metadata_path: Path,
+) -> tuple[Path, dict[str, Any]]:
+    metadata = load_json(metadata_path, {})
+    claimed_name = Path(str(metadata.get("claimed_name", "")))
+    if claimed_name.name != str(claimed_name) or not metadata.get("source_name"):
+        raise ValueError(f"Invalid import claim metadata: {metadata_path.name}")
+    claim_path = _require_claim_path(root, claims_dir / claimed_name)
+    return claim_path, metadata
 
 
 def _archive_source(root: Path, source: Path, destination: Path, expected_hash: str) -> None:
+    _require_claim_path(root, source)
     _require_archive_path(root, destination)
+    if source.resolve() == destination.resolve():
+        raise ValueError("Claimed import and archive destination must be different files")
     if not _file_matches(source, expected_hash):
         raise OSError(f"Import source is missing or changed: {source.name}")
-    source_fingerprint = _file_fingerprint(source)
     if _file_matches(destination, expected_hash):
-        _remove_source_if_unchanged(source, source_fingerprint, expected_hash)
+        source.unlink()
         return
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     _require_archive_path(root, destination)
     with tempfile.NamedTemporaryFile(
-        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp", delete=False,
+        dir=destination.parent, prefix=".spending-archive-", suffix=".tmp", delete=False,
     ) as temporary_handle:
         temporary = Path(temporary_handle.name)
     try:
@@ -137,7 +222,7 @@ def _archive_source(root: Path, source: Path, destination: Path, expected_hash: 
         temporary.replace(destination)
         if not _file_matches(destination, expected_hash):
             raise OSError(f"Archived copy could not be verified: {source.name}")
-        _remove_source_if_unchanged(source, source_fingerprint, expected_hash)
+        source.unlink()
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -185,7 +270,7 @@ def _merge_staged_import(
 
 
 def _finish_pending_import(
-    root: Path, imports_dir: Path, pending_path: Path,
+    root: Path, imports_dir: Path, claims_dir: Path, pending_path: Path,
     existing: dict[str, dict[str, Any]], imports: list[dict[str, Any]],
     imports_by_hash: dict[str, dict[str, Any]], transaction_dir: Path, import_path: Path,
 ) -> dict[str, Any]:
@@ -198,18 +283,36 @@ def _finish_pending_import(
     )
     import_record = pending["import_record"]
     destination = _recorded_archive_path(root, import_record)
-    source = _find_import_source(imports_dir, pending["source_name"], file_hash)
-    if _file_matches(destination, file_hash):
-        if source is not None:
-            _archive_source(root, source, destination, file_hash)
-    elif source is not None:
+    metadata_path: Path | None = None
+    source: Path | None = None
+    if pending.get("claim_metadata"):
+        metadata_path = claims_dir / Path(pending["claim_metadata"]).name
+        source, _ = _load_claim(root, claims_dir, metadata_path)
+    if source is None or not source.exists():
+        public_source = _find_import_source(
+            imports_dir, pending["source_name"], file_hash,
+        )
+        if public_source is not None:
+            if metadata_path is None:
+                source, metadata_path, _ = _claim_public_source(
+                    root, imports_dir, claims_dir, public_source,
+                )
+                pending["claim_metadata"] = metadata_path.name
+                pending["claimed_name"] = source.name
+                save_json(pending_path, pending)
+            else:
+                public_source.replace(source)
+
+    if source is not None and source.exists():
         _archive_source(root, source, destination, file_hash)
-    else:
+    elif not _file_matches(destination, file_hash):
         raise OSError(
             f"The original for pending import {pending['source_name']} is missing. "
             "Put that CSV back in the Import folder or provide it with --import-from."
         )
     pending_path.unlink()
+    if metadata_path is not None:
+        metadata_path.unlink(missing_ok=True)
     return import_record
 
 
@@ -235,15 +338,29 @@ def process(
             f"An older workspace was found at {root}. "
             "Convert it explicitly with --migrate-profile NAME."
         )
+    with _profile_lock(root):
+        return _process_locked(
+            root, non_interactive, profile_name=profile_name,
+            external_import_source=external_import_source,
+        )
+
+
+def _process_locked(
+    root: Path,
+    non_interactive: bool,
+    *,
+    profile_name: str | None = None,
+    external_import_source: Path | None = None,
+) -> int:
 
     imports_dir = root / "imports"
     archive_dir = root / "archive"
     data_dir = root / "data"
     rules_dir = root / "rules"
     reports_dir = root / "reports"
-    for directory in (imports_dir, archive_dir, data_dir, rules_dir, reports_dir):
-        _require_profile_path(root, directory / ".profile-path-check")
-        directory.mkdir(parents=True, exist_ok=True)
+    _prepare_managed_directories(
+        root, [imports_dir, archive_dir, data_dir, rules_dir, reports_dir],
+    )
 
     if profile_name:
         print(f"Profile: {profile_name}")
@@ -258,8 +375,19 @@ def process(
     transaction_dir = data_dir / "transactions"
     decision_dir = data_dir / "decisions"
     pending_dir = data_dir / "pending-imports"
+    claims_dir = pending_dir / "claims"
     _require_profile_path(root, pending_dir / ".profile-path-check")
     pending_dir.mkdir(parents=True, exist_ok=True)
+    _require_profile_path(root, claims_dir / ".profile-path-check")
+    if claims_dir.is_symlink():
+        raise ValueError(f"Managed claim folder cannot be a symlink: {claims_dir}")
+    claims_dir.mkdir(parents=True, exist_ok=True)
+    for stale_external_copy in imports_dir.glob(".external-import-*.tmp"):
+        stale_external_copy.unlink()
+    for stale_snapshot in pending_dir.glob(".source-*.tmp"):
+        stale_snapshot.unlink()
+    for stale_archive_copy in archive_dir.rglob(".spending-archive-*.tmp"):
+        stale_archive_copy.unlink()
     transactions = load_year_shards(transaction_dir)
     for transaction in transactions:
         transaction["identifier"] = clean_identifier_value(transaction["provider"], transaction["identifier"])
@@ -356,7 +484,8 @@ def process(
     for pending_path in pending_paths:
         try:
             import_record = _finish_pending_import(
-                root, imports_dir, pending_path, existing, imports, imports_by_hash,
+                root, imports_dir, claims_dir, pending_path,
+                existing, imports, imports_by_hash,
                 transaction_dir, import_path,
             )
             file_hash = import_record["sha256"]
@@ -368,46 +497,102 @@ def process(
             print(f"ERROR: Could not recover {pending_path.name}: {exc}", file=sys.stderr)
             break
 
+    claimed_items: list[tuple[Path, Path, dict[str, Any]]] = []
+    if not failed_files:
+        for metadata_path in sorted(claims_dir.glob("*.json")):
+            try:
+                claim_path, metadata = _load_claim(root, claims_dir, metadata_path)
+                if not claim_path.exists():
+                    expected_hash = metadata.get("sha256", "")
+                    archived_path = metadata.get("archive_path", "")
+                    if expected_hash and archived_path and _file_matches(
+                        _recorded_archive_path(root, {"archived_path": archived_path}),
+                        expected_hash,
+                    ):
+                        metadata_path.unlink()
+                        continue
+                    public_source = (
+                        _find_import_source(
+                            imports_dir, metadata["source_name"], expected_hash,
+                        )
+                        if expected_hash else imports_dir / metadata["source_name"]
+                    )
+                    if not public_source.is_file() or public_source.is_symlink():
+                        raise OSError(
+                            f"Claimed import is missing: {metadata['source_name']}"
+                        )
+                    public_source.replace(claim_path)
+                claimed_items.append((claim_path, metadata_path, metadata))
+            except Exception as exc:
+                failed_files += 1
+                print(f"ERROR: Could not recover {metadata_path.name}: {exc}", file=sys.stderr)
+                break
+
     csv_paths: list[Path] = []
     if not failed_files:
         csv_paths = sorted(
             path for path in imports_dir.iterdir()
             if path.is_file() and path.suffix.lower() == ".csv"
         )
-        if not csv_paths:
+        if not csv_paths and not claimed_items:
             print("No new CSV files found.")
             if existing:
                 print("Using the existing transaction history; skipped categories can still be completed.")
 
-    for path in csv_paths:
-        snapshot: Path | None = None
+    work_items: list[tuple[Path, Path | None, dict[str, Any] | None]] = [
+        (claim_path, metadata_path, metadata)
+        for claim_path, metadata_path, metadata in claimed_items
+    ] + [(path, None, None) for path in csv_paths]
+    for path, metadata_path, metadata in work_items:
+        pending_created = False
+        resume_needed = False
         try:
-            snapshot, file_hash = _snapshot_csv(path, pending_dir)
+            if metadata is None or metadata_path is None:
+                path, metadata_path, metadata = _claim_public_source(
+                    root, imports_dir, claims_dir, path,
+                )
+            source_name = metadata["source_name"]
+            file_hash = sha256_file(path)
+            saved_hash = metadata.get("sha256", "")
+            if saved_hash and saved_hash != file_hash:
+                raise OSError(f"Claimed import changed unexpectedly: {source_name}")
+            metadata["sha256"] = file_hash
+            save_json(metadata_path, metadata)
             if file_hash in known_files:
                 import_record = imports_by_hash[file_hash]
-                destination = _recorded_archive_path(root, import_record)
-                if _file_matches(destination, file_hash):
-                    duplicate_directory = archive_dir / "duplicates"
-                    duplicate_destination = _duplicate_archive_destination(
-                        root, duplicate_directory, path.name, file_hash,
+                if metadata.get("archive_path"):
+                    destination = _recorded_archive_path(
+                        root, {"archived_path": metadata["archive_path"]},
                     )
-                    _archive_source(root, path, duplicate_destination, file_hash)
-                    print(f"Duplicate file archived without reimporting: {path.name}")
-                    duplicate_files += 1
+                elif _archive_is_complete(root, import_record):
+                    duplicate_directory = archive_dir / "duplicates"
+                    destination = _duplicate_archive_destination(
+                        root, duplicate_directory, source_name, file_hash,
+                    )
                 else:
-                    _archive_source(root, path, destination, file_hash)
-                    print(f"Restored missing or incomplete archive: {path.name}")
+                    destination = _recorded_archive_path(root, import_record)
+                metadata["archive_path"] = str(destination.relative_to(root))
+                save_json(metadata_path, metadata)
+                resume_needed = True
+                primary_destination = _recorded_archive_path(root, import_record)
+                _archive_source(root, path, destination, file_hash)
+                metadata_path.unlink()
+                if destination == primary_destination:
+                    print(f"Restored missing or incomplete archive: {source_name}")
                     recovered_files += 1
+                else:
+                    print(f"Duplicate file archived without reimporting: {source_name}")
+                    duplicate_files += 1
                 continue
 
-            provider, rows = read_csv(snapshot)
-            account = account_id(provider, path.name)
+            provider, rows = read_csv(path)
+            account = account_id(provider, source_name)
             occurrence: Counter[str] = Counter()
             file_new = file_repeated = 0
             staged_transactions: list[dict[str, Any]] = []
             dates: list[str] = []
             for row in rows:
-                transaction = normalize_row(provider, account, row, path.name, settings)
+                transaction = normalize_row(provider, account, row, source_name, settings)
                 base = transaction_base_key(transaction)
                 occurrence[base] += 1
                 transaction_id = stable_hash(base, occurrence[base])
@@ -426,7 +611,7 @@ def process(
             )
             import_record = {
                 "sha256": file_hash,
-                "original_filename": path.name,
+                "original_filename": source_name,
                 "archived_path": str(destination.relative_to(root)),
                 "provider": provider,
                 "account": account,
@@ -439,26 +624,32 @@ def process(
             pending_path = pending_dir / f"{file_hash}.json"
             save_json(pending_path, {
                 "sha256": file_hash,
-                "source_name": path.name,
+                "source_name": source_name,
+                "claim_metadata": metadata_path.name,
+                "claimed_name": path.name,
                 "transactions": staged_transactions,
                 "import_record": import_record,
             })
+            pending_created = True
             _finish_pending_import(
-                root, imports_dir, pending_path, existing, imports, imports_by_hash,
+                root, imports_dir, claims_dir, pending_path,
+                existing, imports, imports_by_hash,
                 transaction_dir, import_path,
             )
             known_files.add(file_hash)
             imported_files += 1
             new_transactions += file_new
             repeated_transactions += file_repeated
-            print(f"Imported {path.name}: {file_new} new, {file_repeated} already known")
+            print(f"Imported {source_name}: {file_new} new, {file_repeated} already known")
         except Exception as exc:
+            source_name = metadata.get("source_name", path.name) if metadata else path.name
+            if metadata is not None and metadata_path is not None and not pending_created and not resume_needed:
+                _restore_uncommitted_claim(
+                    root, imports_dir, path, metadata_path, source_name,
+                )
             failed_files += 1
-            print(f"ERROR: Could not import {path.name}: {exc}", file=sys.stderr)
+            print(f"ERROR: Could not import {source_name}: {exc}", file=sys.stderr)
             break
-        finally:
-            if snapshot is not None:
-                snapshot.unlink(missing_ok=True)
 
     if not failed_files:
         for import_record in imports:
@@ -477,8 +668,8 @@ def process(
     if failed_files:
         print("\nProcessing stopped before categorization and report generation.")
         print(f"  Files needing attention: {failed_files}")
-        print("  Existing reports were not regenerated and may not include CSVs still in the Import folder.")
-        print("  Fix or remove the unresolved CSVs, then run this command again.")
+        print("  Existing reports were not regenerated and may not include unresolved imports.")
+        print("  Original files were kept for retry. Fix or remove the unresolved CSVs, then run again.")
         return 1
     if not transactions:
         print(f"Next: add bank CSV exports to {imports_dir} and run this command again.")
