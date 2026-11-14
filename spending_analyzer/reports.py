@@ -301,7 +301,7 @@ def generate_xlsx(
     dashboard["A1"].alignment = Alignment(vertical="center")
     dashboard.merge_cells("H1:J1")
     dashboard["H1"] = (profile_name or "Monthly overview").upper()
-    dashboard["H1"].font = Font(size=10, bold=True, color=dashboard_salmon)
+    dashboard["H1"].font = Font(size=10, bold=True, color=dashboard_salmon_dark)
     dashboard["H1"].alignment = Alignment(horizontal="right", vertical="center")
     dashboard.merge_cells("H2:J2")
     dashboard["H2"] = "SPENDING ANALYZER"
@@ -312,7 +312,7 @@ def generate_xlsx(
 
     dashboard.merge_cells("A3:J3")
     dashboard["A3"] = (
-        "Month result = total money in - net spending. Positive means more money came in than went out."
+        "Month result = income + reimbursements - net spending. Positive means more came in than went out."
         + (
             f"  {summary['uncategorized_count']} uncategorized entr"
             f"{'y' if summary['uncategorized_count'] == 1 else 'ies'} still need review."
@@ -349,10 +349,12 @@ def generate_xlsx(
 
     month_result = summary["net_after_spending"]
     total_money_in = summary["income"] + summary["reimbursements"]
-    month_result_label = (
-        "Month result · more in than out"
-        if month_result >= 0 else "Month result · more out than in"
-    )
+    if month_result > 0:
+        month_result_label = "Month result · more in than out"
+    elif month_result < 0:
+        month_result_label = "Month result · more out than in"
+    else:
+        month_result_label = "Month result · balanced"
     set_metric(
         "A5:E5", "A6:E8", month_result_label, month_result,
         fill=dashboard_salmon_dark,
@@ -360,7 +362,7 @@ def generate_xlsx(
         number_format='+$#,##0.00;-$#,##0.00;$0.00',
     )
     set_metric(
-        "F5:G5", "F6:G7", "Total money in", total_money_in,
+        "F5:G5", "F6:G7", "Income + reimbursements", total_money_in,
         fill=dashboard_neutral_soft, value_size=17,
     )
     set_metric(
@@ -394,14 +396,17 @@ def generate_xlsx(
     dashboard.merge_cells("A10:F10")
     dashboard["A10"] = "Who the spending was for"
     dashboard["A10"].font = Font(size=12, bold=True, color=dashboard_text)
-    estimated_unreimbursed = max(summary["other_people_after_reimbursements"], Decimal("0"))
+    other_people_spending = summary["other_people_spending"]
+    pooled_gap = max(summary["other_people_after_reimbursements"], Decimal("0"))
     dashboard.merge_cells("G10:J10")
-    if not summary["other_people_spending"]:
-        dashboard["G10"] = "No spending marked for other people"
-    elif estimated_unreimbursed:
-        dashboard["G10"] = "Not all spending for others was reimbursed"
+    if other_people_spending < 0:
+        dashboard["G10"] = "Refunds exceeded spending marked for other people"
+    elif other_people_spending == 0:
+        dashboard["G10"] = "No net spending marked for other people"
+    elif pooled_gap:
+        dashboard["G10"] = "Pooled reimbursements were lower than marked spending"
     else:
-        dashboard["G10"] = "Spending for others was covered by reimbursements"
+        dashboard["G10"] = "Pooled reimbursements met or exceeded marked spending"
     dashboard["G10"].font = Font(size=10, bold=True, color=dashboard_text)
 
     allocation_cards = [
@@ -419,9 +424,9 @@ def generate_xlsx(
 
     soft_card("G11:J17", dashboard_neutral_soft)
     comparison = [
-        ("Spent for other people", summary["other_people_spending"]),
-        ("Reimbursements received", summary["reimbursements"]),
-        ("Still not reimbursed (estimate)", estimated_unreimbursed),
+        ("Net spending marked for others", other_people_spending),
+        ("Pooled reimbursements", summary["reimbursements"]),
+        ("Gap after pooled reimbursements", pooled_gap),
     ]
     for row, (label, amount) in enumerate(comparison, 11):
         dashboard.merge_cells(start_row=row, start_column=7, end_row=row, end_column=9)
@@ -431,24 +436,29 @@ def generate_xlsx(
         dashboard.cell(row, 10).number_format = currency_format
         dashboard.cell(row, 10).font = Font(
             size=11, bold=row == 13,
-            color=dashboard_salmon if row == 13 and estimated_unreimbursed else dashboard_text,
+            color=dashboard_salmon_dark if row == 13 and pooled_gap else dashboard_text,
         )
         dashboard.cell(row, 10).alignment = Alignment(horizontal="right")
     dashboard.merge_cells("G15:J17")
-    if not summary["other_people_spending"]:
+    if other_people_spending < 0:
         dashboard["G15"] = (
-            "No spending was marked for other people. Reimbursements are pooled, "
-            "not linked to individual people yet."
+            f"Refunds or credits exceeded purchases marked for other people by "
+            f"${abs(other_people_spending):,.2f}. Reimbursements are pooled separately."
         )
-    elif estimated_unreimbursed:
+    elif other_people_spending == 0:
         dashboard["G15"] = (
-            f"About ${estimated_unreimbursed:,.2f} more was spent for other people than received back. "
-            "Reimbursements are pooled, not linked to individual people yet."
+            "No net spending was marked for other people. Reimbursements are pooled "
+            "and not linked to individual people yet."
+        )
+    elif pooled_gap:
+        dashboard["G15"] = (
+            f"Pooled reimbursements were ${pooled_gap:,.2f} lower than marked spending "
+            "for others. They are not linked to individual people yet."
         )
     else:
         dashboard["G15"] = (
-            "Recorded reimbursements cover all marked spending for other people. "
-            "Reimbursements are pooled, not linked to individual people yet."
+            "Pooled reimbursements were at least as large as marked spending for others. "
+            "This does not confirm which purchases were repaid."
         )
     dashboard["G15"].font = Font(size=8, italic=True, color=dashboard_muted)
     dashboard["G15"].alignment = Alignment(wrap_text=True, vertical="center")
@@ -471,7 +481,7 @@ def generate_xlsx(
     if dominant_category:
         dashboard.merge_cells("A22:D22")
         dashboard["A22"] = "LARGEST CATEGORY"
-        dashboard["A22"].font = Font(size=9, bold=True, color=dashboard_salmon)
+        dashboard["A22"].font = Font(size=9, bold=True, color=dashboard_salmon_dark)
         dashboard.merge_cells("A23:D24")
         dashboard["A23"] = dominant_category[0]
         dashboard["A23"].font = Font(size=16, bold=True, color=dashboard_text)

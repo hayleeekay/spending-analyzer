@@ -1336,6 +1336,7 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.assertEqual(dashboard["A6"].value, 850)
         self.assertEqual(dashboard["F6"].value, 1060)
         self.assertEqual(dashboard["H6"].value, 210)
+        self.assertEqual(dashboard["F5"].value, "INCOME + REIMBURSEMENTS")
         self.assertIn("Income $1,000.00", dashboard["F8"].value)
         self.assertIn("reimbursements $60.00", dashboard["F8"].value)
         self.assertEqual(
@@ -1343,7 +1344,10 @@ application.process(Path(sys.argv[1]), non_interactive=True)
             [65, 90, 25, 30],
         )
         self.assertEqual([dashboard.cell(row, 10).value for row in range(11, 14)], [90, 60, 30])
-        self.assertEqual(dashboard["G10"].value, "Not all spending for others was reimbursed")
+        self.assertEqual(
+            dashboard["G10"].value,
+            "Pooled reimbursements were lower than marked spending",
+        )
         category_values = {
             dashboard.cell(row, 12).value: dashboard.cell(row, 13).value
             for row in range(2, 7)
@@ -1365,7 +1369,8 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         workbook = load_workbook(destination, data_only=True)
         self.addCleanup(workbook.close)
         self.assertEqual(workbook["Dashboard"]["A6"].value, 0)
-        self.assertEqual(workbook["Dashboard"]["G10"].value, "No spending marked for other people")
+        self.assertEqual(workbook["Dashboard"]["A5"].value, "MONTH RESULT · BALANCED")
+        self.assertEqual(workbook["Dashboard"]["G10"].value, "No net spending marked for other people")
         self.assertEqual(workbook["Dashboard"]["A23"].value, "No categories had net purchases this month.")
         self.assertEqual(
             workbook["Dashboard"]["A36"].value,
@@ -1373,6 +1378,30 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         )
         self.assertEqual(workbook["Dashboard"]._charts, [])
         self.assertEqual(workbook["Transactions"].max_row, 1)
+
+    def test_excel_dashboard_does_not_describe_other_person_refunds_as_reimbursement(self):
+        transaction = {
+            "provider": "apple", "account": "apple", "date": "2026-07-01",
+            "post_date": "2026-07-01", "description": "FICTIONAL REFUND",
+            "kind": "refund", "raw_amount": "30", "category": "Shopping",
+            "responsibility": "Alex", "identifier": "FICTIONAL REFUND",
+            "bank_category": "Test", "bank_type": "Refund", "splits": [],
+        }
+        destination = self.root / "other-person-refund.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", [transaction], destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(
+            dashboard["G10"].value,
+            "Refunds exceeded spending marked for other people",
+        )
+        self.assertEqual([dashboard.cell(row, 10).value for row in range(11, 14)], [-30, 0, 0])
+        self.assertIn("Refunds or credits exceeded purchases", dashboard["G15"].value)
 
     def test_excel_dashboard_summarizes_large_category_lists(self):
         transactions = []
