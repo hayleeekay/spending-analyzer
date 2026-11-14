@@ -4,12 +4,16 @@ This file is a short, manually updated history of each released version.
 
 ## Unreleased
 
+## 1.1.0 - 2026-11-14
+
 - Split the application into focused modules without changing its saved data or terminal workflow.
 - Prevent Excel reports from interpreting imported text as formulas.
 - Make CSV imports recoverable across validation failures and interrupted archive steps.
 - Organize all financial data into isolated profiles with guided setup and selection.
 - Support read-only imports from an external folder.
-- Redesign the Excel workbook as a clearer monthly brief with detailed category, person, bill, and transaction sheets.
+- Add explicit, interruption-safe conversion for older workspaces.
+- Redesign the Excel and HTML reports with clearer monthly summaries and responsive presentation.
+- Add a fictional demo and expanded usage and provider documentation.
 
 ## 1.0.0 - 2026-08-03
 

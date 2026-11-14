@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -36,6 +37,23 @@ class SpendingAnalyzerTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_package_and_command_versions_match(self):
+        project_root = Path(__file__).resolve().parents[1]
+        metadata = tomllib.loads(
+            (project_root / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        declared_version = metadata["project"]["version"]
+        self.assertEqual(analyzer.__version__, declared_version)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "spending_analyzer", "--version"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.stdout.strip(), f"spending-analyzer {declared_version}")
 
     def test_settings_are_merged_and_validated(self):
         path = self.root / "rules/settings.json"

@@ -1,6 +1,6 @@
 """Shared defaults and supported bank export layouts."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CATEGORIES = [
     "Groceries",
