@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import spending_analyzer as analyzer
+from spending_analyzer import application
 
 
 def write_csv(path, headers, rows):
@@ -863,6 +864,37 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(len(restored), 2)
         self.assertEqual(list((self.root / "data/pending-imports/claims").iterdir()), [])
 
+    def test_rejected_claim_restore_retries_if_destination_appears(self):
+        source = self.imports / "discover.csv"
+        headers = list(analyzer.PROVIDER_HEADERS["discover"])
+        row = {
+            "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+            "Description": "ORIGINAL", "Amount": "10.00", "Category": "Shopping",
+        }
+        write_csv(source, headers, [row])
+        real_link = os.link
+        attempted_destination = None
+
+        def add_competing_file_before_restore(claim, destination, **kwargs):
+            nonlocal attempted_destination
+            if attempted_destination is None:
+                attempted_destination = Path(destination)
+                attempted_destination.write_text("newer download", encoding="utf-8")
+            return real_link(claim, destination, **kwargs)
+
+        with (
+            patch("spending_analyzer.application.read_csv", side_effect=ValueError("rejected")),
+            patch("spending_analyzer.application.os.link", side_effect=add_competing_file_before_restore),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+
+        self.assertEqual(attempted_destination.read_text(encoding="utf-8"), "newer download")
+        restored = sorted(self.imports.glob("*.csv"))
+        self.assertEqual(len(restored), 2)
+        self.assertTrue(any("ORIGINAL" in path.read_text(encoding="utf-8") for path in restored))
+        self.assertEqual(claimed_csvs(self.root), [])
+
     def test_pending_archive_symlink_cannot_alias_import_source(self):
         source = self.imports / "discover.csv"
         write_csv(
@@ -984,6 +1016,45 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(claimed_csvs(self.root), [])
         self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
 
+    def test_interruption_immediately_after_claim_rename_keeps_metadata(self):
+        source = self.imports / "discover.csv"
+        write_csv(
+            source,
+            list(analyzer.PROVIDER_HEADERS["discover"]),
+            [{
+                "Trans. Date": "07/01/2026", "Post Date": "07/02/2026",
+                "Description": "STORE", "Amount": "10.00", "Category": "Shopping",
+            }],
+        )
+        real_replace = Path.replace
+
+        def interrupt_after_claim(path, target):
+            result = real_replace(path, target)
+            target = Path(target)
+            if target.parent.name == "claims" and target.suffix == ".csv":
+                raise KeyboardInterrupt()
+            return result
+
+        with patch.object(Path, "replace", interrupt_after_claim):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.process(self.root, non_interactive=True)
+
+        claims = claimed_csvs(self.root)
+        self.assertEqual(len(claims), 1)
+        self.assertTrue(claims[0].with_suffix(".json").is_file())
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+        self.assertEqual(claimed_csvs(self.root), [])
+
+    def test_orphaned_claim_is_reported_and_preserved(self):
+        claims = self.root / "data/pending-imports/claims"
+        claims.mkdir(parents=True)
+        orphan = claims / "fictional.csv"
+        orphan.write_text("private fictional data", encoding="utf-8")
+        with patch("sys.stderr") as stderr:
+            self.assertEqual(analyzer.process(self.root, non_interactive=True), 1)
+        self.assertTrue(orphan.exists())
+        self.assertIn("metadata is missing", stderr.write.call_args_list[0].args[0])
+
     def test_abrupt_stop_before_journal_recovers_lock_and_claim(self):
         source = self.imports / "discover.csv"
         write_csv(
@@ -1018,7 +1089,7 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.assertEqual(len(claimed_csvs(self.root)), 1)
 
         self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
-        self.assertFalse((self.root / ".spending-analyzer.lock").exists())
+        self.assertTrue((self.root / ".spending-analyzer.lock").exists())
         self.assertEqual(claimed_csvs(self.root), [])
         self.assertEqual(len(analyzer.load_year_shards(self.root / "data/transactions")), 1)
 
@@ -1030,7 +1101,7 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         with self.assertRaisesRegex(ValueError, "cannot be symlinks"):
             analyzer.process(self.root, non_interactive=True)
 
-    def test_stale_lock_and_old_snapshot_are_recovered(self):
+    def test_existing_lock_marker_and_old_snapshot_are_recovered(self):
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / ".spending-analyzer.lock").write_text("99999999", encoding="utf-8")
         pending = self.root / "data/pending-imports"
@@ -1039,13 +1110,12 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         stale_snapshot.write_text("fictional private copy", encoding="utf-8")
         self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
         self.assertFalse(stale_snapshot.exists())
-        self.assertFalse((self.root / ".spending-analyzer.lock").exists())
+        self.assertTrue((self.root / ".spending-analyzer.lock").exists())
 
     def test_active_profile_lock_blocks_second_run(self):
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / ".spending-analyzer.lock").write_text(str(os.getpid()), encoding="utf-8")
-        with self.assertRaisesRegex(RuntimeError, "Another Spending Analyzer run"):
-            analyzer.process(self.root, non_interactive=True)
+        with application._profile_lock(self.root):
+            with self.assertRaisesRegex(RuntimeError, "Another Spending Analyzer run"):
+                analyzer.process(self.root, non_interactive=True)
 
     def test_archive_symlink_cannot_leave_profile(self):
         outside = Path(self.temporary.name) / "outside"

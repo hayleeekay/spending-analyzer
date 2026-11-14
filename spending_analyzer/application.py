@@ -12,6 +12,11 @@ import sys
 import tempfile
 from typing import Any
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 from .categorization import (
     apply_rules_and_decisions,
     ask_bill_responsibility,
@@ -43,46 +48,51 @@ from .storage import (
 from .workspaces import LegacyWorkspaceError
 
 
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def _acquire_file_lock(descriptor: int) -> None:
+    if os.name == "nt":
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_file_lock(descriptor: int) -> None:
+    if os.name == "nt":
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 @contextmanager
 def _profile_lock(root: Path):
+    # Keep the marker file. The OS lock, not the filename, owns the active run.
     lock_path = root / ".spending-analyzer.lock"
     root.mkdir(parents=True, exist_ok=True)
-    for attempt in range(2):
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            try:
-                owner = int(lock_path.read_text(encoding="utf-8").strip())
-            except (OSError, ValueError):
-                owner = None
-            if attempt == 0 and owner is not None and not _pid_is_running(owner):
-                lock_path.unlink(missing_ok=True)
-                continue
-            raise RuntimeError(
-                f"Another Spending Analyzer run is using this profile. "
-                f"If no run is active, remove {lock_path}."
-            )
-    else:
-        raise RuntimeError(f"Could not lock profile: {root}")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(str(os.getpid()))
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b" ")
+        try:
+            _acquire_file_lock(descriptor)
+        except OSError as exc:
+            raise RuntimeError(
+                "Another Spending Analyzer run is using this profile."
+            ) from exc
+        acquired = True
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        owner = str(os.getpid()).encode("ascii")
+        os.write(descriptor, owner)
+        os.ftruncate(descriptor, len(owner))
+        os.fsync(descriptor)
         yield
     finally:
-        lock_path.unlink(missing_ok=True)
+        try:
+            if acquired:
+                _release_file_lock(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _require_profile_path(root: Path, path: Path) -> Path:
@@ -172,7 +182,8 @@ def _claim_public_source(
     try:
         source.replace(claim_path)
     except BaseException:
-        metadata_path.unlink(missing_ok=True)
+        if not claim_path.exists():
+            metadata_path.unlink(missing_ok=True)
         raise
     return claim_path, metadata_path, metadata
 
@@ -182,8 +193,15 @@ def _restore_uncommitted_claim(
     source_name: str,
 ) -> None:
     if claim_path.exists():
-        destination = _unique_profile_destination(root, imports_dir, source_name)
-        claim_path.replace(destination)
+        while True:
+            destination = _unique_profile_destination(root, imports_dir, source_name)
+            try:
+                # A hard link claims the destination without overwriting a newer file.
+                os.link(claim_path, destination, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            claim_path.unlink()
+            break
     metadata_path.unlink(missing_ok=True)
 
 
@@ -382,6 +400,18 @@ def _process_locked(
     if claims_dir.is_symlink():
         raise ValueError(f"Managed claim folder cannot be a symlink: {claims_dir}")
     claims_dir.mkdir(parents=True, exist_ok=True)
+    orphaned_claims = sorted(
+        claim for claim in claims_dir.glob("*.csv")
+        if not claim.with_suffix(".json").is_file()
+    )
+    if orphaned_claims:
+        names = ", ".join(claim.name for claim in orphaned_claims)
+        print(
+            f"ERROR: Claimed import metadata is missing for: {names}. "
+            "The claimed CSV was kept unchanged for manual recovery.",
+            file=sys.stderr,
+        )
+        return 1
     for stale_external_copy in imports_dir.glob(".external-import-*.tmp"):
         stale_external_copy.unlink()
     for stale_snapshot in pending_dir.glob(".source-*.tmp"):
