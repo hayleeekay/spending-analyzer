@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import copy
 import csv
 from decimal import Decimal
 import html
@@ -161,14 +162,15 @@ def generate_xlsx(
     month: str, transactions: list[dict[str, Any]], destination: Path,
     personless_categories: set[str] | None = None,
     default_person: str = "", other_people_categories: set[str] | None = None,
+    profile_name: str = "",
 ) -> None:
     try:
         from openpyxl import Workbook
-        from openpyxl.chart import BarChart, DoughnutChart, LineChart, Reference
+        from openpyxl.chart import BarChart, Reference
         from openpyxl.formatting.rule import CellIsRule
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-        from openpyxl.worksheet.table import Table, TableStyleInfo
         from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.table import Table, TableStyleInfo
     except ImportError as exc:
         raise RuntimeError("Excel support requires: python3 -m pip install -r requirements.txt") from exc
     summary = month_summary(
@@ -179,10 +181,35 @@ def generate_xlsx(
     workbook = Workbook()
     dashboard = workbook.active
     dashboard.title = "Dashboard"
-    navy, blue, pale_blue = "17365D", "4472C4", "D9EAF7"
-    green, pale_green, red, pale_red = "548235", "E2F0D9", "C00000", "FCE4D6"
-    currency_format = '$#,##0.00;[Red]-$#,##0.00'
-    thin_gray = Side(style="thin", color="D9E1F2")
+    navy, accent, accent_dark = "243447", "4E718B", "36566C"
+    pale, light, line = "EAF0F4", "F6F8FA", "D7DEE5"
+    text, muted, outflow, inflow = "202A33", "5D6872", "A44A3F", "3D6E78"
+    currency_format = '$#,##0.00;-$#,##0.00;$0.00'
+    thin_gray = Side(style="thin", color=line)
+
+    def fill_range(sheet, cell_range: str, color: str) -> None:
+        for row in sheet[cell_range]:
+            for cell in row:
+                cell.fill = PatternFill("solid", fgColor=color)
+
+    def border_range(sheet, cell_range: str) -> None:
+        for row in sheet[cell_range]:
+            for cell in row:
+                cell.border = Border(
+                    left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray,
+                )
+
+    def set_print_layout(sheet, orientation: str = "landscape") -> None:
+        sheet.page_setup.orientation = orientation
+        sheet.page_setup.fitToWidth = 1
+        sheet.page_setup.fitToHeight = 0
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.page_margins.left = 0.35
+        sheet.page_margins.right = 0.35
+        sheet.page_margins.top = 0.5
+        sheet.page_margins.bottom = 0.5
+        sheet.oddFooter.center.text = f"Spending Analyzer | {month}"
+        sheet.oddFooter.right.text = "Page &P of &N"
 
     def style_data_sheet(sheet, widths: list[int], table_name: str) -> None:
         sheet.freeze_panes = "A2"
@@ -202,159 +229,230 @@ def generate_xlsx(
                 showLastColumn=False, showRowStripes=True, showColumnStripes=False,
             )
             sheet.add_table(table)
+        set_print_layout(sheet)
 
     dashboard.sheet_view.showGridLines = False
-    dashboard.sheet_properties.tabColor = blue
+    dashboard.sheet_view.zoomScale = 85
+    dashboard.sheet_properties.tabColor = accent
     dashboard.merge_cells("A1:H1")
-    dashboard["A1"] = f"Spending Dashboard - {month}"
-    dashboard["A1"].font = Font(size=22, bold=True, color="FFFFFF")
+    dashboard["A1"] = "Monthly spending brief"
+    dashboard["A1"].font = Font(size=24, bold=True, color="FFFFFF")
     dashboard["A1"].fill = PatternFill("solid", fgColor=navy)
     dashboard["A1"].alignment = Alignment(vertical="center")
-    dashboard.row_dimensions[1].height = 38
+    fill_range(dashboard, "A1:H1", navy)
+    dashboard.row_dimensions[1].height = 42
     dashboard.merge_cells("A2:H2")
-    dashboard["A2"] = "Money out is shown as negative; money in is positive. Card payments and transfers are excluded from spending totals."
-    dashboard["A2"].font = Font(italic=True, color="595959")
+    context = f"Month: {month}"
+    if profile_name:
+        context += f"  |  Profile: {profile_name}"
+    dashboard["A2"] = context
+    dashboard["A2"].font = Font(size=11, bold=True, color=accent_dark)
+    dashboard.merge_cells("A3:H3")
+    dashboard["A3"] = (
+        "Purchases minus refunds equals net spending. Card payments and transfers are "
+        "excluded from spending and income totals."
+    )
+    dashboard["A3"].font = Font(italic=True, color=muted)
+    dashboard["A3"].alignment = Alignment(wrap_text=True, vertical="top")
+    dashboard.row_dimensions[3].height = 30
 
-    primary_label = default_person or "Default person"
-    primary_by_category: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    remaining_by_category: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    dashboard_people: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    def metric_block(
+        label_range: str, value_range: str, label: str, value: Decimal,
+        *, hero: bool = False,
+    ) -> None:
+        dashboard.merge_cells(label_range)
+        dashboard.merge_cells(value_range)
+        fill_range(dashboard, label_range, pale if hero else light)
+        fill_range(dashboard, value_range, pale if hero else light)
+        border_range(dashboard, label_range)
+        border_range(dashboard, value_range)
+        label_cell = dashboard[label_range.split(":")[0]]
+        value_cell = dashboard[value_range.split(":")[0]]
+        label_cell.value = label.upper()
+        label_cell.font = Font(size=10, bold=True, color=accent_dark)
+        label_cell.alignment = Alignment(vertical="center")
+        value_cell.value = float(value)
+        value_cell.number_format = currency_format
+        value_cell.font = Font(size=24 if hero else 18, bold=True, color=text)
+        value_cell.alignment = Alignment(vertical="center")
+
+    metric_block("A5:C5", "A6:C7", "Net spending", summary["net_spending"], hero=True)
+    metric_block("D5:F5", "D6:F7", "Purchases", summary["spending"])
+    metric_block("G5:H5", "G6:H7", "Refunds and credits", summary["refunds"])
+    dashboard.row_dimensions[6].height = 28
+    dashboard.row_dimensions[7].height = 20
+
+    allocation_totals = {
+        default_person or "Default person": Decimal("0"),
+        "Other people / groups": Decimal("0"),
+        "Unassigned" if default_person else "Unassigned / no default person": Decimal("0"),
+        "Category-only": Decimal("0"),
+    }
     for transaction in transactions:
         for category, amount, responsibility in category_entries(transaction):
-            if default_person and responsibility.casefold() == default_person.casefold():
-                primary_by_category[category] += amount
-                dashboard_people[default_person] += amount
+            is_other = category in other_people_categories or (
+                responsibility and default_person
+                and responsibility.casefold() != default_person.casefold()
+            )
+            if is_other:
+                allocation_totals["Other people / groups"] += amount
+            elif category in personless_categories:
+                allocation_totals["Category-only"] += amount
+            elif default_person and responsibility.casefold() == default_person.casefold():
+                allocation_totals[default_person] += amount
             else:
-                remaining_by_category[category] += amount
-                label = category if category in personless_categories else (responsibility or "Unassigned")
-                dashboard_people[label] += amount
-    primary_spending = sum(primary_by_category.values(), Decimal("0"))
-    cards = [
-        (f"{primary_label}'s spending", primary_spending, pale_blue),
-        ("Spending assigned to others", summary["other_people_spending"], pale_blue),
-        ("Estimated reimbursements", summary["reimbursements"], pale_green),
-        ("Others spending − reimbursements", summary["other_people_after_reimbursements"], pale_red),
-        ("Income", summary["income"], pale_green),
-        ("Refunds and credits", summary["refunds"], pale_green),
+                key = "Unassigned" if default_person else "Unassigned / no default person"
+                allocation_totals[key] += amount
+
+    def section_title(cell_range: str, title: str) -> None:
+        dashboard.merge_cells(cell_range)
+        start = cell_range.split(":")[0]
+        fill_range(dashboard, cell_range, accent_dark)
+        dashboard[start] = title
+        dashboard[start].font = Font(size=11, bold=True, color="FFFFFF")
+        dashboard[start].alignment = Alignment(vertical="center")
+
+    section_title("A9:D9", "Where net spending was assigned")
+    dashboard["A10"], dashboard["B10"] = "Allocation", "Net amount"
+    for cell in dashboard[10][:2]:
+        cell.font = Font(bold=True, color=accent_dark)
+        cell.fill = PatternFill("solid", fgColor=pale)
+    for row, (label, amount) in enumerate(allocation_totals.items(), 11):
+        dashboard.cell(row, 1, label)
+        dashboard.cell(row, 2, float(amount))
+        dashboard.cell(row, 2).number_format = currency_format
+    dashboard["A15"], dashboard["B15"] = "Total net spending", float(sum(allocation_totals.values()))
+    dashboard["A15"].font = dashboard["B15"].font = Font(bold=True, color=text)
+    dashboard["B15"].number_format = currency_format
+    border_range(dashboard, "A10:B15")
+
+    section_title("E9:H9", "Spending for others and reimbursements")
+    comparison = [
+        ("Spending assigned to others", summary["other_people_spending"]),
+        ("Estimated reimbursements", summary["reimbursements"]),
+        ("Difference", summary["other_people_after_reimbursements"]),
     ]
-    for index, (label, value, fill) in enumerate(cards):
-        row = 4 + (index // 3) * 3
-        col = 1 + (index % 3) * 3
-        dashboard.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 1)
-        dashboard.merge_cells(start_row=row + 1, start_column=col, end_row=row + 1, end_column=col + 1)
-        label_cell = dashboard.cell(row, col, label)
-        value_cell = dashboard.cell(row + 1, col, float(value))
-        for target in (label_cell, value_cell):
-            target.fill = PatternFill("solid", fgColor=fill)
-            target.border = Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
-        label_cell.font = Font(bold=True, color=navy)
-        value_cell.font = Font(size=17, bold=True, color=green if value >= 0 else red)
-        value_cell.number_format = currency_format
-
-    category_items = [(name, amount) for name, amount in sorted(
-        summary["categories"].items(), key=lambda item: (-item[1], item[0])
-    ) if amount != 0]
-    comparison_categories = sorted(
-        set(primary_by_category) | set(remaining_by_category),
-        key=lambda category: (-(primary_by_category[category] + remaining_by_category[category]), category),
+    for row, (label, amount) in enumerate(comparison, 10):
+        dashboard.cell(row, 5, label)
+        dashboard.cell(row, 8, float(amount))
+        dashboard.cell(row, 8).number_format = currency_format
+    dashboard["E12"].font = dashboard["H12"].font = Font(bold=True, color=text)
+    border_range(dashboard, "E10:H12")
+    dashboard.merge_cells("E14:H15")
+    dashboard["E14"] = (
+        "Estimate only. The difference is not a debt balance, confirmed reimbursement, "
+        "or money saved."
     )
-    dashboard.append([])
-    dashboard["J1"], dashboard["K1"], dashboard["L1"] = "Category", primary_label, "Everyone else / groups"
-    for row, category in enumerate(comparison_categories, 2):
-        dashboard.cell(row, 10, category)
-        dashboard.cell(row, 11, float(primary_by_category[category]))
-        dashboard.cell(row, 12, float(remaining_by_category[category]))
-    people_items = [(name, amount) for name, amount in sorted(
-        dashboard_people.items(), key=lambda item: (-item[1], item[0])
-    ) if amount != 0]
-    dashboard["N1"], dashboard["O1"] = "Person or group", "Amount"
-    for row, (name, amount) in enumerate(people_items, 2):
-        dashboard.cell(row, 14, name)
-        dashboard.cell(row, 15, float(amount))
-    primary_items = [(name, amount) for name, amount in sorted(
-        primary_by_category.items(), key=lambda item: (-item[1], item[0])
-    ) if amount > 0]
-    dashboard["Q1"], dashboard["R1"] = "Default person's category", "Amount"
-    for row, (name, amount) in enumerate(primary_items, 2):
-        dashboard.cell(row, 17, name)
-        dashboard.cell(row, 18, float(amount))
-    dashboard["T1"], dashboard["U1"] = "Reimbursement comparison", "Amount"
-    dashboard["T2"], dashboard["U2"] = "Spending assigned to others", float(summary["other_people_spending"])
-    dashboard["T3"], dashboard["U3"] = "Estimated reimbursements", float(summary["reimbursements"])
-    dashboard["W1"], dashboard["X1"] = "All categories", "Amount"
+    dashboard["E14"].font = Font(size=9, italic=True, color=muted)
+    dashboard["E14"].alignment = Alignment(wrap_text=True, vertical="top")
+
+    section_title("A17:D17", "Money in and monthly net flow")
+    flow_rows = [
+        ("Income", summary["income"]),
+        ("Estimated reimbursements", summary["reimbursements"]),
+        ("Income + reimbursements - net spending", summary["net_after_spending"]),
+    ]
+    for row, (label, amount) in enumerate(flow_rows, 18):
+        dashboard.cell(row, 1, label)
+        dashboard.cell(row, 4, float(amount))
+        dashboard.cell(row, 4).number_format = currency_format
+    dashboard["A20"].font = dashboard["D20"].font = Font(bold=True, color=text)
+    border_range(dashboard, "A18:D20")
+
+    section_title("E17:H17", "How to read this report")
+    dashboard.merge_cells("E18:H20")
+    dashboard["E18"] = (
+        "Net flow describes transactions in this report. It is not a bank balance, "
+        "savings total, or amount guaranteed to be available. Exact rows are on the "
+        "Categories, People, Bills, and Transactions sheets."
+    )
+    dashboard["E18"].font = Font(size=9, color=muted)
+    dashboard["E18"].alignment = Alignment(wrap_text=True, vertical="top")
+
+    positive_categories = sorted(
+        (
+            (name, amount) for name, amount in summary["categories"].items()
+            if amount > 0
+        ),
+        key=lambda item: (item[1], item[0].casefold()),
+    )
+    nonpositive_categories = sorted(
+        (
+            (name, amount) for name, amount in summary["categories"].items()
+            if amount <= 0
+        ),
+        key=lambda item: (item[1], item[0].casefold()),
+    )
+    category_items = positive_categories + nonpositive_categories
+    dashboard["J1"], dashboard["K1"] = "Category", "Net amount"
     for row, (name, amount) in enumerate(category_items, 2):
-        dashboard.cell(row, 23, name)
-        dashboard.cell(row, 24, float(amount))
+        dashboard.cell(row, 10, name)
+        dashboard.cell(row, 11, float(amount))
 
-    if comparison_categories:
+    section_title("A22:H22", "Net spending by category")
+    if positive_categories:
         chart = BarChart()
         chart.type = "bar"
-        chart.grouping = "stacked"
-        chart.overlap = 100
-        chart.style = 10
-        chart.title = f"Categories: {primary_label} vs everyone else"
-        chart.x_axis.title = "Net spending"
-        chart.add_data(Reference(dashboard, min_col=11, max_col=12, min_row=1, max_row=len(comparison_categories) + 1), titles_from_data=True)
-        chart.set_categories(Reference(dashboard, min_col=10, min_row=2, max_row=len(comparison_categories) + 1))
-        chart.height, chart.width = 10, 14
-        dashboard.add_chart(chart, "A11")
-    if people_items:
-        chart = BarChart()
-        chart.type = "bar"
-        chart.style = 10
-        chart.title = "Spending by person or group"
-        chart.y_axis.title = "Person"
-        chart.x_axis.title = "Amount"
-        chart.add_data(Reference(dashboard, min_col=15, min_row=1, max_row=len(people_items) + 1), titles_from_data=True)
-        chart.set_categories(Reference(dashboard, min_col=14, min_row=2, max_row=len(people_items) + 1))
-        chart.height, chart.width = 10, 14
-        dashboard.add_chart(chart, "G11")
+        chart.title = "Categories with net purchases"
+        chart.y_axis.title = "Net spending"
+        chart.legend = None
+        chart.add_data(
+            Reference(
+                dashboard, min_col=11, min_row=1,
+                max_row=len(positive_categories) + 1,
+            ),
+            titles_from_data=True,
+        )
+        chart.set_categories(
+            Reference(
+                dashboard, min_col=10, min_row=2,
+                max_row=len(positive_categories) + 1,
+            ),
+        )
+        chart.visible_cells_only = False
+        chart.height = min(13, max(8, 5 + len(positive_categories) * 0.55))
+        chart.width = 22
+        dashboard.add_chart(chart, "A23")
+    else:
+        dashboard["A24"] = "No categories had net purchases this month."
+        dashboard["A24"].font = Font(italic=True, color=muted)
 
-    chart = BarChart()
-    chart.type = "col"
-    chart.style = 10
-    chart.title = "Others' spending compared with reimbursements"
-    chart.y_axis.title = "Amount"
-    chart.add_data(Reference(dashboard, min_col=21, min_row=1, max_row=3), titles_from_data=True)
-    chart.set_categories(Reference(dashboard, min_col=20, min_row=2, max_row=3))
-    chart.height, chart.width = 8, 14
-    dashboard.add_chart(chart, "A31")
-    if primary_items:
-        chart = DoughnutChart()
-        chart.title = f"{primary_label}'s spending by category"
-        chart.add_data(Reference(dashboard, min_col=18, min_row=1, max_row=len(primary_items) + 1), titles_from_data=True)
-        chart.set_categories(Reference(dashboard, min_col=17, min_row=2, max_row=len(primary_items) + 1))
-        chart.height, chart.width = 8, 14
-        chart.holeSize = 55
-        dashboard.add_chart(chart, "G31")
-
-    daily: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-    for transaction in transactions:
-        daily[transaction["date"]] += expense_amount(transaction) - credit_amount(transaction)
-    dashboard["Z1"], dashboard["AA1"] = "Date", "Net spending"
-    for row, (date, amount) in enumerate(sorted(daily.items()), 2):
-        dashboard.cell(row, 26, date)
-        dashboard.cell(row, 27, float(amount))
-    if category_items:
-        chart = DoughnutChart()
-        chart.title = "All net spending by category (additional context)"
-        chart.add_data(Reference(dashboard, min_col=24, min_row=1, max_row=len(category_items) + 1), titles_from_data=True)
-        chart.set_categories(Reference(dashboard, min_col=23, min_row=2, max_row=len(category_items) + 1))
-        chart.height, chart.width = 8, 14
-        chart.holeSize = 55
-        dashboard.add_chart(chart, "A48")
-    if daily:
-        chart = LineChart()
-        chart.title = "Daily net spending (additional context)"
-        chart.y_axis.title = "Amount"
-        chart.add_data(Reference(dashboard, min_col=27, min_row=1, max_row=len(daily) + 1), titles_from_data=True)
-        chart.set_categories(Reference(dashboard, min_col=26, min_row=2, max_row=len(daily) + 1))
-        chart.height, chart.width = 8, 14
-        dashboard.add_chart(chart, "G48")
-    for column in range(10, 28):
-        dashboard.column_dimensions[get_column_letter(column)].hidden = True
-    for column in range(1, 13):
-        dashboard.column_dimensions[get_column_letter(column)].width = 18
+    section_title("A42:H42", "Refund-heavy and zero categories")
+    dashboard["A43"], dashboard["B43"] = "Category", "Net amount"
+    dashboard["A43"].font = dashboard["B43"].font = Font(
+        bold=True, color=accent_dark,
+    )
+    dashboard["A43"].fill = dashboard["B43"].fill = PatternFill(
+        "solid", fgColor=pale,
+    )
+    if nonpositive_categories:
+        for row, (name, amount) in enumerate(nonpositive_categories, 44):
+            dashboard.cell(row, 1, name)
+            dashboard.cell(row, 2, float(amount))
+            dashboard.cell(row, 2).number_format = currency_format
+        nonpositive_end = 43 + len(nonpositive_categories)
+    else:
+        dashboard["A44"] = "None"
+        dashboard["B44"] = 0
+        dashboard["B44"].number_format = currency_format
+        nonpositive_end = 44
+    border_range(dashboard, f"A43:B{nonpositive_end}")
+    note_row = nonpositive_end + 2
+    dashboard.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=8)
+    dashboard.cell(note_row, 1).value = (
+        "These values are listed separately so refunds are not mistaken for spending bars. "
+        "A negative total means refunds or credits exceeded purchases in that category."
+    )
+    dashboard.cell(note_row, 1).font = Font(size=9, italic=True, color=muted)
+    dashboard.cell(note_row, 1).alignment = Alignment(wrap_text=True)
+    for column in ("J", "K"):
+        dashboard.column_dimensions[column].hidden = True
+    for column, width in enumerate([25, 16, 4, 18, 25, 4, 22, 17], 1):
+        dashboard.column_dimensions[get_column_letter(column)].width = width
+    dashboard.freeze_panes = "A4"
+    dashboard.print_area = f"A1:H{note_row}"
+    set_print_layout(dashboard)
+    dashboard.page_setup.fitToHeight = 1
 
     category_person_totals: dict[str, dict[str, Decimal]] = defaultdict(
         lambda: defaultdict(lambda: Decimal("0"))
@@ -363,7 +461,7 @@ def generate_xlsx(
     for transaction in transactions:
         for category, amount, responsibility in category_entries(transaction):
             if category in personless_categories:
-                person = "Personless / group"
+                person = "Category-only"
                 detail_person = ""
             else:
                 person = responsibility or "Unassigned"
@@ -374,7 +472,7 @@ def generate_xlsx(
         person for totals in category_person_totals.values() for person in totals
     }, key=lambda person: (
         0 if default_person and person.casefold() == default_person.casefold() else
-        2 if person == "Personless / group" else 1,
+        2 if person == "Category-only" else 1,
         person.casefold(),
     ))
     matrix_categories = sorted(
@@ -384,21 +482,22 @@ def generate_xlsx(
 
     def build_card_sheet(sheet, title: str, cards: list[tuple[str, list[tuple[str, Decimal]], Decimal]]) -> None:
         sheet.sheet_view.showGridLines = False
-        sheet.merge_cells("A1:H1")
+        sheet.merge_cells("A1:E1")
         sheet["A1"] = title
         sheet["A1"].font = Font(size=20, bold=True, color="FFFFFF")
         sheet["A1"].fill = PatternFill("solid", fgColor=navy)
+        fill_range(sheet, "A1:E1", navy)
         sheet["A1"].alignment = Alignment(vertical="center")
         sheet.row_dimensions[1].height = 34
-        for column in ("A", "D", "G"):
-            sheet.column_dimensions[column].width = 22
-        for column in ("B", "E", "H"):
+        for column in ("A", "D"):
+            sheet.column_dimensions[column].width = 30
+        for column in ("B", "E"):
             sheet.column_dimensions[column].width = 15
-        for column in ("C", "F"):
+        for column in ("C",):
             sheet.column_dimensions[column].width = 3
         row_cursor = 3
-        for start in range(0, len(cards), 3):
-            card_row = cards[start:start + 3]
+        for start in range(0, len(cards), 2):
+            card_row = cards[start:start + 2]
             height = max((len(lines) + 2 for _name, lines, _total in card_row), default=2)
             for index, (name, lines, total) in enumerate(card_row):
                 column = 1 + index * 3
@@ -408,18 +507,21 @@ def generate_xlsx(
                 )
                 heading = sheet.cell(row_cursor, column, name)
                 heading.font = Font(bold=True, color="FFFFFF", size=12)
-                heading.fill = PatternFill("solid", fgColor=blue)
-                heading.alignment = Alignment(vertical="center")
+                heading.fill = PatternFill("solid", fgColor=accent)
+                sheet.cell(row_cursor, column + 1).fill = PatternFill("solid", fgColor=accent)
+                heading.alignment = Alignment(wrap_text=True, vertical="center")
+                if len(name) > 36:
+                    sheet.row_dimensions[row_cursor].height = 32
                 for offset, (label, amount) in enumerate(lines, 1):
                     label_cell = sheet.cell(row_cursor + offset, column, label)
                     amount_cell = sheet.cell(row_cursor + offset, column + 1, float(amount))
                     amount_cell.number_format = currency_format
-                    label_cell.fill = amount_cell.fill = PatternFill("solid", fgColor="F7F9FC")
+                    label_cell.fill = amount_cell.fill = PatternFill("solid", fgColor=light)
                 total_row = row_cursor + len(lines) + 1
                 total_label = sheet.cell(total_row, column, "Total")
                 total_value = sheet.cell(total_row, column + 1, float(total))
                 total_label.font = total_value.font = Font(bold=True, color=navy)
-                total_label.fill = total_value.fill = PatternFill("solid", fgColor=pale_blue)
+                total_label.fill = total_value.fill = PatternFill("solid", fgColor=pale)
                 total_value.number_format = currency_format
                 for row in range(row_cursor, total_row + 1):
                     for col in range(column, column + 2):
@@ -427,14 +529,16 @@ def generate_xlsx(
                             left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray
                         )
             row_cursor += height + 2
+        sheet.freeze_panes = "A3"
+        set_print_layout(sheet, "portrait")
 
     categories = workbook.create_sheet("Categories")
-    categories.sheet_properties.tabColor = "70AD47"
+    categories.sheet_properties.tabColor = accent
     categories.sheet_view.showGridLines = False
     categories.sheet_properties.outlinePr.summaryBelow = False
     categories.append([
         "Category / Person", "Date", "Description", "Account", "Type",
-        "Net Spending Effect (+ purchase / − refund)",
+        "Net Amount",
     ])
     for cell in categories[1]:
         cell.font = Font(color="FFFFFF", bold=True)
@@ -449,7 +553,11 @@ def generate_xlsx(
         categories.append([category, None, f"{len(entries)} categorized item(s)", None, None, float(category_total)])
         for cell in categories[category_row]:
             cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor=blue)
+            cell.fill = PatternFill("solid", fgColor=accent)
+        categories.cell(category_row, 1).alignment = Alignment(
+            wrap_text=True, vertical="center",
+        )
+        categories.row_dimensions[category_row].height = 30
         categories.cell(category_row, 6).number_format = currency_format
         entries_by_person: dict[str, list[tuple[dict[str, Any], Decimal]]] = defaultdict(list)
         for transaction, amount, person in entries:
@@ -461,7 +569,7 @@ def generate_xlsx(
                 categories.append([person, None, None, None, None, float(person_total)])
                 for cell in categories[person_row]:
                     cell.font = Font(bold=True, color=navy)
-                    cell.fill = PatternFill("solid", fgColor=pale_blue)
+                    cell.fill = PatternFill("solid", fgColor=pale)
                 categories.cell(person_row, 6).number_format = currency_format
                 categories.row_dimensions[person_row].outlineLevel = 1
             for transaction, amount in person_entries:
@@ -481,10 +589,12 @@ def generate_xlsx(
     categories.freeze_panes = "A2"
     for index, width in enumerate([26, 12, 48, 20, 16, 25], 1):
         categories.column_dimensions[get_column_letter(index)].width = width
+    categories.print_title_rows = "1:1"
+    set_print_layout(categories)
 
     people_cards = []
     for person in person_columns:
-        if person == "Personless / group":
+        if person == "Category-only":
             continue
         lines = [
             (category, category_person_totals[category][person])
@@ -493,15 +603,15 @@ def generate_xlsx(
         lines.sort(key=lambda item: (-item[1], item[0]))
         people_cards.append((person, lines, sum((amount for _category, amount in lines), Decimal("0"))))
     for category in matrix_categories:
-        amount = category_person_totals[category].get("Personless / group", Decimal("0"))
+        amount = category_person_totals[category].get("Category-only", Decimal("0"))
         if amount:
-            people_cards.append((category, [], amount))
+            people_cards.append((f"Category-only: {category}", [], amount))
     people_sheet = workbook.create_sheet("People")
-    people_sheet.sheet_properties.tabColor = "5B9BD5"
-    build_card_sheet(people_sheet, "People and groups by category", people_cards)
+    people_sheet.sheet_properties.tabColor = accent
+    build_card_sheet(people_sheet, "People and category-only groups", people_cards)
 
     bills = workbook.create_sheet("Bills")
-    bills.sheet_properties.tabColor = "ED7D31"
+    bills.sheet_properties.tabColor = accent
     bills.sheet_view.showGridLines = False
     bills.sheet_properties.outlinePr.summaryBelow = False
     bills.append(["For", "Date", "Bill", "Account", "Type", "Net Amount"])
@@ -518,7 +628,7 @@ def generate_xlsx(
         bills.append([person, None, f"{len(entries)} bill(s)", None, None, float(total)])
         for cell in bills[person_row]:
             cell.font = Font(bold=True, color=navy)
-            cell.fill = PatternFill("solid", fgColor=pale_blue)
+            cell.fill = PatternFill("solid", fgColor=pale)
         bills.cell(person_row, 6).number_format = currency_format
         for transaction, amount in entries:
             bills.append([
@@ -537,9 +647,11 @@ def generate_xlsx(
     bills.freeze_panes = "A2"
     for index, width in enumerate([24, 12, 48, 20, 16, 18], 1):
         bills.column_dimensions[get_column_letter(index)].width = width
+    bills.print_title_rows = "1:1"
+    set_print_layout(bills)
 
     sheet = workbook.create_sheet("Transactions")
-    sheet.sheet_properties.tabColor = "A5A5A5"
+    sheet.sheet_properties.tabColor = accent
     headers = [
         "Date", "Account", "Description", "Type", "Category / Split", "For",
         "Money Out", "Money In", "Cash Flow", "Included in Spending?",
@@ -561,17 +673,26 @@ def generate_xlsx(
             transaction["bank_category"], transaction["bank_type"], transaction["post_date"],
         ])
     style_data_sheet(sheet, [12, 20, 46, 19, 24, 20, 15, 15, 15, 21, 38, 25, 18, 12], "TransactionTable")
+    sheet.page_setup.fitToWidth = 2
     for row in range(2, sheet.max_row + 1):
         for column in (7, 8, 9):
             sheet.cell(row, column).number_format = currency_format
     if sheet.max_row >= 2:
         sheet.conditional_formatting.add(
-            f"I2:I{sheet.max_row}", CellIsRule(operator="lessThan", formula=["0"], font=Font(color=red))
+            f"I2:I{sheet.max_row}",
+            CellIsRule(operator="lessThan", formula=["0"], font=Font(color=outflow)),
         )
         sheet.conditional_formatting.add(
-            f"I2:I{sheet.max_row}", CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=green))
+            f"I2:I{sheet.max_row}",
+            CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=inflow)),
         )
 
+    for worksheet in workbook.worksheets:
+        for row in worksheet.iter_rows():
+            for cell in row:
+                updated_font = copy(cell.font)
+                updated_font.name = "Arial"
+                cell.font = updated_font
     _preserve_excel_text(workbook)
     workbook.save(destination)
 

@@ -781,6 +781,7 @@ def _process_locked(
         generate_xlsx(
             month, month_transactions, month_report_dir / "spending-report.xlsx",
             personless_categories, default_person, other_people_categories,
+            profile_name=profile_name or "",
         )
 
     print("\nProcessing complete")
