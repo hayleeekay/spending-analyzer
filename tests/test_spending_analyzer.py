@@ -472,7 +472,7 @@ class SpendingAnalyzerTest(unittest.TestCase):
         self.assertEqual(workbook.sheetnames[0], "Dashboard")
         self.assertEqual(workbook.sheetnames, ["Dashboard", "Categories", "People", "Bills", "Transactions"])
         self.assertEqual(workbook["Categories"]["A1"].value, "Category / Person")
-        self.assertEqual(workbook["People"]["A1"].value, "People and category-only groups")
+        self.assertEqual(workbook["People"]["A1"].value, "Spending by person")
         self.assertEqual(
             workbook["Categories"].cell(workbook["Categories"].max_row, 1).value,
             "GRAND TOTAL",
@@ -1331,26 +1331,26 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         workbook = load_workbook(destination, data_only=False)
         self.addCleanup(workbook.close)
         dashboard = workbook["Dashboard"]
-        self.assertEqual(dashboard["A1"].value, "Monthly spending brief")
-        self.assertIn("Month: 2026-07", dashboard["A2"].value)
-        self.assertIn("Profile: alex", dashboard["A2"].value)
-        self.assertEqual(dashboard["A6"].value, 210)
-        self.assertEqual(dashboard["D6"].value, 315)
-        self.assertEqual(dashboard["G6"].value, 105)
-        self.assertEqual([dashboard.cell(row, 2).value for row in range(11, 16)], [65, 90, 30, 25, 210])
-        self.assertEqual([dashboard.cell(row, 8).value for row in range(10, 13)], [90, 60, 30])
-        self.assertEqual([dashboard.cell(row, 4).value for row in range(18, 21)], [1000, 60, 850])
-        category_values = {
-            dashboard.cell(row, 10).value: dashboard.cell(row, 11).value
-            for row in range(2, 2 + len({item["category"] for item in transactions if item["kind"] in {"expense", "refund"}}))
-        }
-        self.assertEqual(category_values["Gifts"], -15)
-        self.assertEqual(category_values["Transit"], 0)
-        self.assertEqual(category_values[long_category], 25)
+        self.assertEqual(dashboard["A1"].value, "July 2026 spending")
+        self.assertEqual(dashboard["H1"].value, "ALEX")
+        self.assertEqual(dashboard["A6"].value, 850)
+        self.assertEqual(dashboard["F6"].value, 1060)
+        self.assertEqual(dashboard["H6"].value, 210)
+        self.assertIn("Income $1,000.00", dashboard["F8"].value)
+        self.assertIn("reimbursements $60.00", dashboard["F8"].value)
         self.assertEqual(
-            [(dashboard.cell(row, 1).value, dashboard.cell(row, 2).value) for row in (44, 45)],
-            [("Gifts", -15), ("Transit", 0)],
+            [dashboard[cell].value for cell in ("A12", "D12", "A16", "D16")],
+            [65, 90, 25, 30],
         )
+        self.assertEqual([dashboard.cell(row, 10).value for row in range(11, 14)], [90, 60, 30])
+        self.assertEqual(dashboard["G10"].value, "Not all spending for others was reimbursed")
+        category_values = {
+            dashboard.cell(row, 12).value: dashboard.cell(row, 13).value
+            for row in range(2, 7)
+        }
+        self.assertEqual(category_values[long_category], 25)
+        self.assertIn("Gifts: -$15.00", dashboard["A36"].value)
+        self.assertIn("Transit: $0.00", dashboard["A36"].value)
         self.assertEqual(len(dashboard._charts), 1)
         self.assertEqual(
             workbook.sheetnames,
@@ -1365,15 +1365,16 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         workbook = load_workbook(destination, data_only=True)
         self.addCleanup(workbook.close)
         self.assertEqual(workbook["Dashboard"]["A6"].value, 0)
-        self.assertEqual(workbook["Dashboard"]["A24"].value, "No categories had net purchases this month.")
+        self.assertEqual(workbook["Dashboard"]["G10"].value, "No spending marked for other people")
+        self.assertEqual(workbook["Dashboard"]["A23"].value, "No categories had net purchases this month.")
         self.assertEqual(
-            workbook["Dashboard"]["A43"].value,
-            "No refund-heavy or zero categories were recorded.",
+            workbook["Dashboard"]["A36"].value,
+            "None this month.",
         )
         self.assertEqual(workbook["Dashboard"]._charts, [])
         self.assertEqual(workbook["Transactions"].max_row, 1)
 
-    def test_excel_dashboard_places_refund_table_after_a_large_chart(self):
+    def test_excel_dashboard_summarizes_large_category_lists(self):
         transactions = []
         for index in range(1, 41):
             kind = "expense" if index <= 30 else "refund"
@@ -1394,12 +1395,64 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         workbook = load_workbook(destination, data_only=True)
         self.addCleanup(workbook.close)
         dashboard = workbook["Dashboard"]
-        section_row = next(
-            cell.row for row in dashboard.iter_rows() for cell in row
-            if cell.value == "Refund-heavy and zero categories"
+        self.assertEqual(dashboard["L2"].value, "Category 30")
+        self.assertEqual(dashboard["L8"].value, "Category 24")
+        self.assertIn("23 smaller categories", dashboard["A21"].value)
+        self.assertIn("Category 40: -$40.00", dashboard["A36"].value)
+        self.assertIn("+6 more on Categories", dashboard["A36"].value)
+        self.assertEqual(len(dashboard._charts), 1)
+
+    def test_excel_dashboard_separates_a_dominant_category(self):
+        transactions = [
+            {
+                "provider": "apple", "account": "apple", "date": "2026-07-01",
+                "post_date": "2026-07-01", "description": "FICTIONAL RENT",
+                "kind": "expense", "raw_amount": "1000", "category": "Housing",
+                "responsibility": "Primary", "identifier": "FICTIONAL RENT",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            },
+            {
+                "provider": "apple", "account": "apple", "date": "2026-07-02",
+                "post_date": "2026-07-02", "description": "FICTIONAL FOOD",
+                "kind": "expense", "raw_amount": "100", "category": "Dining",
+                "responsibility": "Primary", "identifier": "FICTIONAL FOOD",
+                "bank_category": "Test", "bank_type": "Test", "splits": [],
+            },
+        ]
+        destination = self.root / "dominant-category.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", transactions, destination, default_person="Primary",
         )
-        self.assertGreaterEqual(section_row, 50)
-        self.assertEqual(dashboard.cell(section_row + 2, 1).value, "Category 40")
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(dashboard["A23"].value, "Housing")
+        self.assertEqual(dashboard["A25"].value, 1000)
+        self.assertEqual(dashboard["L2"].value, "Dining")
+        self.assertEqual(dashboard["M2"].value, 100)
+
+    def test_excel_dashboard_handles_only_one_positive_category(self):
+        transaction = {
+            "provider": "apple", "account": "apple", "date": "2026-07-01",
+            "post_date": "2026-07-01", "description": "FICTIONAL FOOD",
+            "kind": "expense", "raw_amount": "100", "category": "Dining",
+            "responsibility": "Primary", "identifier": "FICTIONAL FOOD",
+            "bank_category": "Test", "bank_type": "Test", "splits": [],
+        }
+        destination = self.root / "one-category.xlsx"
+        analyzer.generate_xlsx(
+            "2026-07", [transaction], destination, default_person="Primary",
+        )
+
+        from openpyxl import load_workbook
+        workbook = load_workbook(destination, data_only=True)
+        self.addCleanup(workbook.close)
+        dashboard = workbook["Dashboard"]
+        self.assertEqual(dashboard["A23"].value, "Dining")
+        self.assertEqual(dashboard["A25"].value, 100)
+        self.assertEqual(dashboard._charts, [])
 
     def test_rules_are_scoped_to_account(self):
         first = {"id": "one", "provider": "chase_credit", "account": "chase_credit-1111", "identifier": "SAMPLE MERCHANT", "kind": "expense"}
