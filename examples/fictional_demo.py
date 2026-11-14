@@ -49,6 +49,8 @@ def main() -> None:
     output = Path(tempfile.mkdtemp(prefix="spending-analyzer-demo-"))
     report_dir = output / "reports" / MONTH
     report_dir.mkdir(parents=True)
+    csv_dir = output / "data" / "by-month"
+    csv_dir.mkdir(parents=True)
 
     transactions = [
         transaction(1, "2026-10-01", "Fictional paycheck", "income", "2400.00"),
@@ -93,11 +95,13 @@ def main() -> None:
         set(),
         profile_name="Fictional demo",
     )
-    write_month_csv(transactions, output / f"{MONTH}.csv")
+    csv_path = csv_dir / f"{MONTH}.csv"
+    write_month_csv(transactions, csv_path)
 
     print(f"Fictional reports created in: {output}")
     print(f"Open: {report_dir / 'spending-report.html'}")
     print(f"Open: {report_dir / 'spending-report.xlsx'}")
+    print(f"Open: {csv_path}")
 
 
 if __name__ == "__main__":
