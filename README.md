@@ -184,6 +184,8 @@ The default Chase-checking policy treats:
 
 These assumptions affect newly imported checking transactions and are configurable in the selected profile's `rules/settings.json`. Copy the shape from [settings.example.json](settings.example.json). Each incoming type accepts `income` or `reimbursement`.
 
+Chase checking uses the amount direction plus recognized descriptions and types. An unfamiliar incoming credit follows the configurable `other_credit` policy, while an unfamiliar outgoing debit is treated as an expense. Card exports with an unsupported explicit transaction type stay in the Import folder for review instead of being guessed.
+
 ## Local data and privacy
 
 All user data lives under the selected storage directory, including:

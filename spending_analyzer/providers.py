@@ -147,6 +147,12 @@ def normalize_row(
     }[provider]
     raw_amount = money(row[amount_key])
     kind = classify_kind(provider, row, raw_amount, settings)
+    if kind == "unknown":
+        reported_type = clean_text(row.get("Type", "") or row.get("Details", "")) or "(blank)"
+        raise ValueError(
+            f"Unsupported {PROVIDER_LABELS[provider]} transaction type {reported_type!r} "
+            f"for amount {raw_amount:.2f}. Explicit provider handling is required before retrying."
+        )
     identifier = clean_identifier(provider, row)
     reference = clean_text(row.get("Reference", "") or row.get("Check or Slip #", "") or row.get("Memo", ""))
     transaction = {
