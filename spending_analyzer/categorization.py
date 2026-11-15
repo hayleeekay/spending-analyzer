@@ -235,7 +235,9 @@ def prompt_for_split(
                 split["responsibility"] = assigned_person
             else:
                 split.pop("responsibility", None)
-    decisions[transaction["id"]] = {"category": "Split", "splits": splits}
+    decisions[transaction["id"]] = {
+        "category": "Split", "splits": splits, "responsibility": "",
+    }
     transaction["category"], transaction["splits"] = "Split", splits
     if save_callback:
         save_callback()
@@ -278,7 +280,9 @@ def _assign_single_transaction_category(
             person = ask_bill_responsibility("Who was this for?", people, save_callback)
         else:
             person = category_person_defaults.get(category, default_person)
-    if category in personless_categories or category in {"Income", "Uncategorized"}:
+    if category in personless_categories:
+        decision["responsibility"] = ""
+    elif category in {"Income", "Uncategorized"}:
         decision.pop("responsibility", None)
     else:
         decision["responsibility"] = person
@@ -478,6 +482,9 @@ def prompt_for_categories(
             for item in items:
                 decisions[item["id"]]["responsibility"] = person
                 item["responsibility"] = person
+        elif category in personless_categories:
+            for item in items:
+                decisions[item["id"]]["responsibility"] = ""
         if save_callback:
             save_callback()
         prompt_to_save_rule(
@@ -537,6 +544,15 @@ def _select_saved_transaction(
                     transaction.get("category", ""),
                     transaction.get("responsibility", ""),
                     transaction.get("raw_amount", ""),
+                    " ".join(
+                        str(value)
+                        for split in transaction.get("splits", [])
+                        for value in (
+                            split.get("category", ""),
+                            split.get("responsibility", ""),
+                            split.get("amount", ""),
+                        )
+                    ),
                 )).casefold()
             ]
         if not matches:
@@ -559,6 +575,19 @@ def _select_saved_transaction(
         amount = abs(money(transaction["raw_amount"]))
         category = transaction.get("category") or "Uncategorized"
         person = transaction.get("responsibility") or "No person"
+        if transaction.get("splits"):
+            split_categories = list(dict.fromkeys(
+                split.get("category", "") for split in transaction["splits"]
+                if split.get("category")
+            ))
+            split_people = list(dict.fromkeys(
+                split.get("responsibility", "") for split in transaction["splits"]
+                if split.get("responsibility")
+            ))
+            if split_categories:
+                category = f"Split ({' / '.join(split_categories)})"
+            if split_people:
+                person = " / ".join(split_people)
         print(
             f"  {number}. {transaction['date']} | {account_label(transaction)} | "
             f"{transaction['description']} | {transaction['kind'].replace('_', ' ').title()} | "

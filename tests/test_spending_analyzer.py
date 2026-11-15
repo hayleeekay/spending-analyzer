@@ -1657,6 +1657,88 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.assertEqual(rules, original_rules)
         self.assertIn("That rule will remain unchanged", output.getvalue())
 
+    def test_personless_correction_overrides_a_rule_person(self):
+        transaction = {
+            "id": "target-one", "provider": "apple", "account": "apple",
+            "identifier": "TARGET", "date": "2026-07-03", "post_date": "2026-07-03",
+            "description": "TARGET", "raw_amount": "25.00", "kind": "expense",
+            "category": "Uncategorized", "responsibility": "", "splits": [],
+            "reference": "", "source_files": [], "bank_category": "",
+            "bank_type": "Purchase",
+        }
+        rules = [{
+            "provider": "apple", "account": "apple", "match_type": "exact",
+            "pattern": "TARGET", "category": "Shopping", "responsibility": "Family",
+        }]
+        decisions = {}
+        with patch("builtins.input", side_effect=["1", "target", "1", "10", "n"]):
+            analyzer.prompt_for_saved_transaction_corrections(
+                [transaction], rules, decisions, default_person="Primary",
+                personless_categories={"Other"},
+            )
+
+        self.assertEqual(decisions["target-one"]["category"], "Other")
+        self.assertEqual(decisions["target-one"]["responsibility"], "")
+        self.assertEqual(transaction["responsibility"], "")
+
+    def test_split_review_search_includes_component_categories_and_people(self):
+        for query in ("Gifts", "Family"):
+            with self.subTest(query=query):
+                transaction = {
+                    "id": "split-one", "provider": "apple", "account": "apple",
+                    "identifier": "TARGET", "date": "2026-07-03",
+                    "post_date": "2026-07-03", "description": "TARGET",
+                    "raw_amount": "25.00", "kind": "expense", "reference": "",
+                    "source_files": [], "bank_category": "", "bank_type": "Purchase",
+                }
+                decisions = {"split-one": {
+                    "category": "Split", "responsibility": "", "splits": [
+                        {"category": "Groceries", "amount": "10.00", "responsibility": "Primary"},
+                        {"category": "Gifts", "amount": "15.00", "responsibility": "Family"},
+                    ],
+                }}
+                output = StringIO()
+                with patch("builtins.input", side_effect=["1", query, "1", "5", "n"]):
+                    with patch("sys.stdout", output):
+                        corrected = analyzer.prompt_for_saved_transaction_corrections(
+                            [transaction], [], decisions, default_person="Primary",
+                        )
+
+                self.assertEqual(corrected, 1)
+                self.assertIn("Split (Groceries / Gifts)", output.getvalue())
+                self.assertIn("Primary / Family", output.getvalue())
+
+    def test_personless_override_survives_normal_processing(self):
+        transaction = {
+            "id": "saved-target", "provider": "apple", "account": "apple",
+            "identifier": "TARGET", "date": "2026-07-03", "post_date": "2026-07-03",
+            "description": "TARGET", "raw_amount": "25.00", "kind": "expense",
+            "reference": "", "source_files": ["old.csv"], "bank_category": "",
+            "bank_type": "Purchase",
+        }
+        rule = {
+            "provider": "apple", "account": "apple", "match_type": "exact",
+            "pattern": "TARGET", "category": "Shopping", "responsibility": "Family",
+        }
+        analyzer.save_json(self.root / "data/transactions/2026.json", [transaction])
+        analyzer.save_json(self.root / "data/decisions/2026.json", {
+            "saved-target": {"category": "Other", "responsibility": ""},
+        })
+        analyzer.save_json(self.root / "rules/rules.json", [rule])
+        analyzer.save_json(self.root / "rules/people.json", ["Primary"])
+        analyzer.save_json(self.root / "rules/settings.json", {
+            "default_person": "Primary", "personless_categories": ["Other"],
+        })
+
+        self.assertEqual(analyzer.process(self.root, non_interactive=True), 0)
+
+        decisions = json.loads((self.root / "data/decisions/2026.json").read_text())
+        self.assertEqual(decisions["saved-target"]["responsibility"], "")
+        with (self.root / "data/by-month/2026-07.csv").open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(rows[0]["category"], "Other")
+        self.assertEqual(rows[0]["responsibility"], "")
+
     def test_saved_incoming_transaction_can_be_corrected_to_income(self):
         transaction = {
             "id": "incoming-one", "provider": "chase_checking",

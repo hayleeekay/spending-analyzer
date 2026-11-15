@@ -736,8 +736,8 @@ def _process_locked(
     if default_person:
         for decision in decisions.values():
             category = decision.get("category", "")
-            if category in personless_categories:
-                decision.pop("responsibility", None)
+            if category in personless_categories or category == "Split":
+                decision["responsibility"] = ""
             if category and category not in {"Uncategorized", "Split"} and not decision.get("responsibility"):
                 if category not in always_ask_categories and category not in personless_categories:
                     decision["responsibility"] = default_person
