@@ -4,6 +4,8 @@ This file is a short, manually updated history of each released version.
 
 ## Unreleased
 
+- Add first-class individual review for grouped purchases and saved-transaction corrections.
+
 ## 1.1.0 - 2026-11-14
 
 - Split the application into focused modules without changing its saved data or terminal workflow.

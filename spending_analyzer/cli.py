@@ -47,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
   spending-analyzer --profile alex --import-from /path/to/exports
       Copy new CSVs from an external folder without changing that folder.
 
+  spending-analyzer review --profile alex
+      Review or correct one saved transaction at a time without changing rules.
+
 Run "spending-analyzer help" or "spending-analyzer --help" to see this guide.
 """,
     )
@@ -72,16 +75,20 @@ Run "spending-analyzer help" or "spending-analyzer --help" to see this guide.
         help="Convert an older root workspace into the named profile, then stop",
     )
     parser.add_argument("--non-interactive", action="store_true", help="Do not ask for categories; leave new expenses uncategorized")
-    parser.add_argument("command", nargs="?", choices=["help"], help=argparse.SUPPRESS)
+    parser.add_argument("command", nargs="?", choices=["help", "review"], help=argparse.SUPPRESS)
     args = parser.parse_args(arguments)
     if args.command == "help":
         parser.print_help()
         return 0
+    if args.command == "review" and args.non_interactive:
+        parser.error("review cannot be combined with --non-interactive")
     try:
         storage_dir = args.storage_dir.expanduser().resolve()
         if args.migrate_profile:
-            if args.profile or args.import_from:
-                parser.error("--migrate-profile cannot be combined with --profile or --import-from")
+            if args.profile or args.import_from or args.command:
+                parser.error(
+                    "--migrate-profile cannot be combined with --profile, --import-from, or a command"
+                )
             profile_dir = migrate_legacy_workspace(storage_dir, args.migrate_profile)
             print(f"Converted the older workspace into profile: {args.migrate_profile}")
             print(f"Profile folder: {profile_dir}")
@@ -138,6 +145,7 @@ Run "spending-analyzer help" or "spending-analyzer --help" to see this guide.
             args.non_interactive,
             profile_name=selected,
             external_import_source=external_source,
+            review_saved=args.command == "review",
         )
     except LegacyWorkspaceError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -13,6 +13,8 @@ from .categorization import (
     migrate_legacy_rules,
     prompt_for_bill_responsibilities,
     prompt_for_categories,
+    prompt_for_individual_categories,
+    prompt_for_saved_transaction_corrections,
     prompt_for_split,
     prompt_to_save_rule,
     rule_matches,

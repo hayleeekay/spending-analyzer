@@ -23,6 +23,7 @@ from .categorization import (
     migrate_legacy_rules,
     prompt_for_bill_responsibilities,
     prompt_for_categories,
+    prompt_for_saved_transaction_corrections,
 )
 from .constants import CATEGORIES
 from .providers import (
@@ -349,7 +350,10 @@ def process(
     *,
     profile_name: str | None = None,
     external_import_source: Path | None = None,
+    review_saved: bool = False,
 ) -> int:
+    if review_saved and non_interactive:
+        raise ValueError("Saved transaction review requires interactive input")
     legacy_folders = [path for path in (root / "inbox", root / "processed") if path.exists()]
     if legacy_folders:
         raise LegacyWorkspaceError(
@@ -360,6 +364,7 @@ def process(
         return _process_locked(
             root, non_interactive, profile_name=profile_name,
             external_import_source=external_import_source,
+            review_saved=review_saved,
         )
 
 
@@ -369,6 +374,7 @@ def _process_locked(
     *,
     profile_name: str | None = None,
     external_import_source: Path | None = None,
+    review_saved: bool = False,
 ) -> int:
 
     imports_dir = root / "imports"
@@ -758,6 +764,14 @@ def _process_locked(
         personless_categories=personless_categories,
     )
     apply_rules_and_decisions(transactions, rules, decisions)
+    corrected = 0
+    if review_saved:
+        corrected = prompt_for_saved_transaction_corrections(
+            transactions, rules, decisions, persist_answers, categories, people,
+            default_person, always_ask_categories, category_person_defaults,
+            personless_categories,
+        )
+        apply_rules_and_decisions(transactions, rules, decisions)
     save_year_shards(transaction_dir, transactions)
     save_json(import_path, imports)
     save_decision_shards(decision_dir, decisions, transactions)
@@ -793,6 +807,8 @@ def _process_locked(
     print(f"  Repeated transaction rows merged: {repeated_transactions}")
     print(f"  Transactions categorized this run: {categorized}")
     print(f"  People assigned this run: {bills_assigned}")
+    if review_saved:
+        print(f"  Saved transactions corrected: {corrected}")
     if migrated_rules:
         print(f"  Older rules safely assigned to an account: {migrated_rules}")
     print(f"  Months currently reported: {', '.join(months) if months else 'none'}")
