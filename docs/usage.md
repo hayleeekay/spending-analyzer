@@ -114,7 +114,7 @@ Run the review command to change one saved transaction without changing any reus
 ./run.sh review --profile alex
 ```
 
-With one profile, the profile name can be omitted. Choose a month, search by description, account, category, person, or amount, and select the transaction. Expenses and refunds can be recategorized, reassigned, or split. Incoming money can be corrected to income or estimated reimbursement.
+With one profile, the profile name can be omitted. Choose a month, search by description, account, category, person, or amount, and select the transaction. Expenses can be recategorized, reassigned, or split. Refunds can be recategorized or reassigned. Incoming money can be corrected to income or estimated reimbursement.
 
 The command first handles any newly imported transactions that still need answers, then opens the saved-transaction review.
 

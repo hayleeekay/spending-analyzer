@@ -1657,6 +1657,89 @@ application.process(Path(sys.argv[1]), non_interactive=True)
         self.assertEqual(rules, original_rules)
         self.assertIn("That rule will remain unchanged", output.getvalue())
 
+    def test_saved_refund_correction_overrides_an_income_rule(self):
+        transaction = {
+            "id": "refund-one", "provider": "apple", "account": "apple",
+            "identifier": "CASHBACK", "date": "2026-07-03", "post_date": "2026-07-03",
+            "description": "CASHBACK", "raw_amount": "25.00", "kind": "refund",
+            "category": "Uncategorized", "responsibility": "", "splits": [],
+            "reference": "", "source_files": [], "bank_category": "",
+            "bank_type": "Credit",
+        }
+        rules = [{
+            "provider": "apple", "account": "apple", "match_type": "exact",
+            "pattern": "CASHBACK", "category": "Income", "kind_override": "income",
+        }]
+        decisions = {}
+        with patch("builtins.input", side_effect=["1", "cashback", "1", "5", "n"]):
+            analyzer.prompt_for_saved_transaction_corrections(
+                [transaction], rules, decisions, default_person="Primary",
+            )
+
+        self.assertEqual(decisions["refund-one"]["kind_override"], "refund")
+        self.assertEqual(transaction["kind"], "refund")
+        self.assertEqual(transaction["category"], "Shopping")
+        analyzer.apply_rules_and_decisions([transaction], rules, decisions)
+        self.assertEqual(transaction["kind"], "refund")
+        self.assertEqual(transaction["category"], "Shopping")
+
+    def test_saved_expense_marked_as_income_can_be_split(self):
+        transaction = {
+            "id": "expense-one", "provider": "apple", "account": "apple",
+            "identifier": "TARGET", "date": "2026-07-03", "post_date": "2026-07-03",
+            "description": "TARGET", "raw_amount": "25.00", "kind": "expense",
+            "category": "Uncategorized", "responsibility": "", "splits": [],
+            "reference": "", "source_files": [], "bank_category": "",
+            "bank_type": "Purchase",
+        }
+        decisions = {"expense-one": {"category": "Income", "kind_override": "income"}}
+        output = StringIO()
+        with patch(
+            "builtins.input", side_effect=["1", "target", "1", "13", "1", "1", "10", "n"],
+        ):
+            with patch("sys.stdout", output):
+                analyzer.prompt_for_saved_transaction_corrections(
+                    [transaction], [], decisions, default_person="Primary",
+                )
+
+        self.assertIn("Split 2026-07-03 | $25.00", output.getvalue())
+        self.assertEqual(decisions["expense-one"]["kind_override"], "expense")
+        self.assertEqual(decisions["expense-one"]["category"], "Split")
+        self.assertEqual(decisions["expense-one"]["splits"], [
+            {"category": "Groceries", "amount": "10.00", "responsibility": "Primary"},
+            {"category": "Dining", "amount": "15.00", "responsibility": "Primary"},
+        ])
+        self.assertEqual(transaction["kind"], "expense")
+
+    def test_interrupted_person_answer_does_not_save_partial_correction(self):
+        transaction = {
+            "id": "saved-one", "provider": "apple", "account": "apple",
+            "identifier": "TARGET", "date": "2026-07-03", "post_date": "2026-07-03",
+            "description": "TARGET", "raw_amount": "25.00", "kind": "expense",
+            "category": "Uncategorized", "responsibility": "", "splits": [],
+            "reference": "", "source_files": [], "bank_category": "",
+            "bank_type": "Purchase",
+        }
+        original = {"category": "Shopping", "responsibility": "Family"}
+        decisions = {"saved-one": dict(original)}
+        saved = []
+
+        def interrupting_save():
+            saved.append(json.loads(json.dumps(decisions)))
+            raise KeyboardInterrupt
+
+        with patch(
+            "builtins.input", side_effect=["1", "target", "1", "8", "New Person"],
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                analyzer.prompt_for_saved_transaction_corrections(
+                    [transaction], [], decisions, interrupting_save,
+                    people=["Primary", "Family"], default_person="Primary",
+                )
+
+        self.assertEqual(decisions["saved-one"], original)
+        self.assertEqual(saved[-1]["saved-one"], original)
+
     def test_personless_correction_overrides_a_rule_person(self):
         transaction = {
             "id": "target-one", "provider": "apple", "account": "apple",

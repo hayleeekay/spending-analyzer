@@ -251,28 +251,36 @@ def _assign_single_transaction_category(
     always_ask_categories: set[str], category_person_defaults: dict[str, str],
     personless_categories: set[str],
 ) -> None:
+    original_kind = transaction.get("original_kind", transaction["kind"])
     if category == "Split":
+        staged_transaction = deepcopy(transaction)
+        staged_transaction["kind"] = original_kind
+        staged_decisions: dict[str, Any] = {}
         prompt_for_split(
-            transaction, decisions, save_callback, categories, people,
+            staged_transaction, staged_decisions, None, categories, people,
             default_person, category_person_defaults, personless_categories,
         )
+        staged_decision = staged_decisions[transaction["id"]]
+        staged_decision["kind_override"] = original_kind
+        decisions[transaction["id"]] = staged_decision
+        transaction["kind"] = original_kind
+        transaction["category"] = "Split"
+        transaction["splits"] = staged_transaction["splits"]
+        transaction["responsibility"] = ""
+        transaction["reviewed"] = False
+        if save_callback:
+            save_callback()
         return
 
-    decision = decisions.setdefault(transaction["id"], {})
+    decision = deepcopy(decisions.get(transaction["id"], {}))
     decision["category"] = category
     decision.pop("splits", None)
-    decision.pop("kind_override", None)
+    decision["kind_override"] = original_kind
     decision.pop("reviewed", None)
-    original_kind = transaction.get("original_kind", transaction["kind"])
-    transaction["kind"] = original_kind
     if category == "Income":
         decision["kind_override"] = "income"
-        transaction["kind"] = "income"
     elif category == "Uncategorized":
         decision["reviewed"] = True
-    transaction["category"] = category
-    transaction["splits"] = []
-    transaction["reviewed"] = category == "Uncategorized"
 
     person = ""
     if category not in personless_categories and category not in {"Income", "Uncategorized"}:
@@ -286,6 +294,11 @@ def _assign_single_transaction_category(
         decision.pop("responsibility", None)
     else:
         decision["responsibility"] = person
+    decisions[transaction["id"]] = decision
+    transaction["kind"] = decision["kind_override"]
+    transaction["category"] = category
+    transaction["splits"] = []
+    transaction["reviewed"] = category == "Uncategorized"
     transaction["responsibility"] = person
     if save_callback:
         save_callback()
