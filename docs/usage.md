@@ -89,6 +89,7 @@ CSV files placed at the storage root or directly inside `profiles/` are not impo
 For an unfamiliar expense or refund, the program shows the date, description, account, and amount. You can:
 
 - choose or add a category;
+- review repeated transactions with the same identifier individually;
 - split one purchase between two categories;
 - assign it to the default person or choose another person;
 - save an account-specific matching rule; or
@@ -101,7 +102,23 @@ At the rule prompt:
 - `M` opens starts-with and literal-contains choices.
 - `N` saves only the current decision, without a reusable rule.
 
+Enter at the category question leaves a transaction for later review. Choosing `Uncategorized` from the numbered list records that you reviewed it and intentionally left it uncategorized.
+
 Completed answers are written immediately. If you stop halfway through, the next run continues with the remaining transactions. At the following category question, `B` undoes the previous completed answer.
+
+### Correcting a saved transaction
+
+Run the review command to change one saved transaction without changing any reusable rule:
+
+```bash
+./run.sh review --profile alex
+```
+
+With one profile, the profile name can be omitted. Choose a month, search by description, account, category, person, or amount, and select the transaction. Expenses can be recategorized, reassigned, or split. Refunds can be recategorized or reassigned. Incoming money can be corrected to income or estimated reimbursement.
+
+The command first handles any newly imported transactions that still need answers, then opens the saved-transaction review.
+
+The correction is written before the command asks whether to review another transaction. Reports are regenerated at the end of the run. If a reusable rule also matches the transaction, the command says so and leaves that rule unchanged.
 
 Provider-supplied categories are kept for reference but never determine the analyzer's category.
 

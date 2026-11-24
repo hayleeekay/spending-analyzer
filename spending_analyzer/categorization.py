@@ -35,9 +35,12 @@ def apply_rules_and_decisions(transactions: list[dict[str, Any]], rules: list[di
         ))
         transaction["splits"] = decision.get("splits", []) if transaction["category"] == "Split" else []
         if transaction["kind"] in {"expense", "refund"} and transaction["category"] != "Uncategorized":
-            transaction["responsibility"] = decision.get("responsibility") or (
-                matching_rule.get("responsibility", "") if matching_rule else ""
-            )
+            if "responsibility" in decision:
+                transaction["responsibility"] = decision["responsibility"]
+            else:
+                transaction["responsibility"] = (
+                    matching_rule.get("responsibility", "") if matching_rule else ""
+                )
         else:
             transaction["responsibility"] = ""
 
@@ -117,7 +120,8 @@ def add_custom_category(
 
 
 def ask_category(
-    allow_split: bool, allow_back: bool = False, categories: list[str] | None = None,
+    allow_split: bool, allow_back: bool = False, allow_review_each: bool = False,
+    categories: list[str] | None = None,
     save_callback: Callable[[], None] | None = None,
     personless_categories: set[str] | None = None,
 ) -> tuple[str, bool]:
@@ -129,11 +133,13 @@ def ask_category(
         split_number = len(categories) + 1
         if allow_split:
             print(f"  {split_number}. Split purchase")
+        if allow_review_each:
+            print("  R. Review these transactions individually")
         print("  Add P after a number to choose who it was for (example: 5p)")
         print("  A. Add a category")
         if allow_back:
             print("  B. Undo previous answer and go back")
-        answer = input("Category number (Enter leaves uncategorized): ").strip().lower()
+        answer = input("Category number (Enter reviews later): ").strip().lower()
         if answer == "a":
             added = add_custom_category(categories, save_callback, personless_categories)
             if added:
@@ -141,6 +147,8 @@ def ask_category(
             continue
         if answer == "b" and allow_back:
             return "__back__", False
+        if answer == "r" and allow_review_each:
+            return "__review_each__", False
         if not answer:
             return "__skip__", False
         choose_person = answer.endswith("p")
@@ -149,7 +157,7 @@ def ask_category(
             return categories[int(number_text) - 1], choose_person
         if allow_split and number_text == str(split_number):
             return "Split", choose_person
-        print("Please enter one of the listed numbers.")
+        print("Please enter one of the listed choices.")
 
 
 def ask_split_category(
@@ -227,11 +235,104 @@ def prompt_for_split(
                 split["responsibility"] = assigned_person
             else:
                 split.pop("responsibility", None)
-    decisions[transaction["id"]] = {"category": "Split", "splits": splits}
+    decisions[transaction["id"]] = {
+        "category": "Split", "splits": splits, "responsibility": "",
+    }
     transaction["category"], transaction["splits"] = "Split", splits
     if save_callback:
         save_callback()
     print("Split saved.")
+
+
+def _assign_single_transaction_category(
+    transaction: dict[str, Any], category: str, choose_person: bool,
+    decisions: dict[str, Any], save_callback: Callable[[], None] | None,
+    categories: list[str], people: list[str], default_person: str,
+    always_ask_categories: set[str], category_person_defaults: dict[str, str],
+    personless_categories: set[str],
+) -> None:
+    original_kind = transaction.get("original_kind", transaction["kind"])
+    if category == "Split":
+        staged_transaction = deepcopy(transaction)
+        staged_transaction["kind"] = original_kind
+        staged_decisions: dict[str, Any] = {}
+        prompt_for_split(
+            staged_transaction, staged_decisions, None, categories, people,
+            default_person, category_person_defaults, personless_categories,
+        )
+        staged_decision = staged_decisions[transaction["id"]]
+        staged_decision["kind_override"] = original_kind
+        decisions[transaction["id"]] = staged_decision
+        transaction["kind"] = original_kind
+        transaction["category"] = "Split"
+        transaction["splits"] = staged_transaction["splits"]
+        transaction["responsibility"] = ""
+        transaction["reviewed"] = False
+        if save_callback:
+            save_callback()
+        return
+
+    decision = deepcopy(decisions.get(transaction["id"], {}))
+    decision["category"] = category
+    decision.pop("splits", None)
+    decision["kind_override"] = original_kind
+    decision.pop("reviewed", None)
+    if category == "Income":
+        decision["kind_override"] = "income"
+    elif category == "Uncategorized":
+        decision["reviewed"] = True
+
+    person = ""
+    if category not in personless_categories and category not in {"Income", "Uncategorized"}:
+        if choose_person or category in always_ask_categories:
+            person = ask_bill_responsibility("Who was this for?", people, save_callback)
+        else:
+            person = category_person_defaults.get(category, default_person)
+    if category in personless_categories:
+        decision["responsibility"] = ""
+    elif category in {"Income", "Uncategorized"}:
+        decision.pop("responsibility", None)
+    else:
+        decision["responsibility"] = person
+    decisions[transaction["id"]] = decision
+    transaction["kind"] = decision["kind_override"]
+    transaction["category"] = category
+    transaction["splits"] = []
+    transaction["reviewed"] = category == "Uncategorized"
+    transaction["responsibility"] = person
+    if save_callback:
+        save_callback()
+
+
+def prompt_for_individual_categories(
+    transactions: list[dict[str, Any]], decisions: dict[str, Any],
+    save_callback: Callable[[], None] | None, categories: list[str],
+    people: list[str], default_person: str, always_ask_categories: set[str],
+    category_person_defaults: dict[str, str], personless_categories: set[str],
+) -> int:
+    print("Reviewing each transaction separately. No reusable rule will be added for this group.")
+    changed = 0
+    for transaction in sorted(transactions, key=lambda value: value["date"]):
+        amount = expense_amount(transaction) or credit_amount(transaction)
+        print(
+            f"\n{transaction['date']} | {transaction['kind'].title()} | "
+            f"${amount:,.2f} | {transaction['description']}"
+        )
+        category, choose_person = ask_category(
+            allow_split=transaction["kind"] == "expense",
+            categories=categories,
+            save_callback=save_callback,
+            personless_categories=personless_categories,
+        )
+        if category == "__skip__":
+            continue
+        _assign_single_transaction_category(
+            transaction, category, choose_person, decisions, save_callback,
+            categories, people, default_person, always_ask_categories,
+            category_person_defaults, personless_categories,
+        )
+        changed += 1
+    return changed
 
 
 def prompt_to_save_rule(
@@ -320,7 +421,8 @@ def prompt_for_categories(
             amount = expense_amount(item) or credit_amount(item)
             print(f"  Transaction {number}: {item['date']} | {item['kind'].title()} | ${amount:,.2f}")
         category, choose_person = ask_category(
-            allow_split=any(item["kind"] == "expense" for item in items), allow_back=bool(history),
+            allow_split=len(items) == 1 and items[0]["kind"] == "expense",
+            allow_back=bool(history), allow_review_each=len(items) > 1,
             categories=categories, save_callback=save_callback, personless_categories=personless_categories,
         )
         if category == "__back__":
@@ -338,55 +440,20 @@ def prompt_for_categories(
             index += 1
             continue
         snapshot = (index, deepcopy(decisions), deepcopy(rules), changed)
+        if category == "__review_each__":
+            changed += prompt_for_individual_categories(
+                items, decisions, save_callback, categories, people, default_person,
+                always_ask_categories, category_person_defaults, personless_categories,
+            )
+            history.append(snapshot)
+            index += 1
+            continue
         if category == "Split":
-            if len(items) == 1 and items[0]["kind"] == "expense":
-                prompt_for_split(
-                    items[0], decisions, save_callback, categories, people, default_person, category_person_defaults
-                    , personless_categories
-                )
-                changed += 1
-                history.append(snapshot)
-                index += 1
-                continue
-            print("Splits apply to one purchase, so these transactions will be reviewed individually.")
-            for item in sorted(items, key=lambda value: value["date"]):
-                amount = expense_amount(item) or credit_amount(item)
-                print(f"\n{item['date']} | {item['kind'].title()} | ${amount:,.2f} | {item['description']}")
-                individual_category, individual_choose_person = ask_category(
-                    allow_split=item["kind"] == "expense", categories=categories, save_callback=save_callback
-                    , personless_categories=personless_categories
-                )
-                if individual_category == "__skip__":
-                    continue
-                if individual_category == "Split":
-                    prompt_for_split(
-                        item, decisions, save_callback, categories, people, default_person, category_person_defaults
-                        , personless_categories
-                    )
-                else:
-                    decisions.setdefault(item["id"], {})["category"] = individual_category
-                    decisions[item["id"]].pop("splits", None)
-                    decisions[item["id"]].pop("kind_override", None)
-                    decisions[item["id"]].pop("reviewed", None)
-                    if individual_category == "Income":
-                        decisions[item["id"]]["kind_override"] = "income"
-                        item["kind"] = "income"
-                    elif individual_category == "Uncategorized":
-                        decisions[item["id"]]["reviewed"] = True
-                    item["category"] = individual_category
-                    item["splits"] = []
-                    person = ""
-                    if individual_category in personless_categories or individual_category in {"Income", "Uncategorized"}:
-                        person = ""
-                    elif individual_choose_person or individual_category in always_ask_categories:
-                        person = ask_bill_responsibility("Who was this for?", people, save_callback)
-                    else:
-                        person = category_person_defaults.get(individual_category, default_person)
-                    decisions[item["id"]]["responsibility"] = person
-                    item["responsibility"] = person
-                    if save_callback:
-                        save_callback()
-                changed += 1
+            prompt_for_split(
+                items[0], decisions, save_callback, categories, people,
+                default_person, category_person_defaults, personless_categories,
+            )
+            changed += 1
             history.append(snapshot)
             index += 1
             continue
@@ -428,6 +495,9 @@ def prompt_for_categories(
             for item in items:
                 decisions[item["id"]]["responsibility"] = person
                 item["responsibility"] = person
+        elif category in personless_categories:
+            for item in items:
+                decisions[item["id"]]["responsibility"] = ""
         if save_callback:
             save_callback()
         prompt_to_save_rule(
@@ -436,6 +506,186 @@ def prompt_for_categories(
         history.append(snapshot)
         index += 1
     return changed
+
+
+def _select_saved_transaction(
+    transactions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    eligible = [
+        transaction for transaction in transactions
+        if transaction.get("original_kind", transaction["kind"])
+        in {"expense", "refund", "income", "reimbursement"}
+    ]
+    if not eligible:
+        print("No saved expenses, refunds, income, or reimbursements are available to review.")
+        return None
+
+    months = sorted({transaction["date"][:7] for transaction in eligible}, reverse=True)
+    print("\nSaved months:")
+    for number, month in enumerate(months, 1):
+        count = sum(transaction["date"].startswith(month) for transaction in eligible)
+        print(f"  {number}. {month} ({count} transaction{'s' if count != 1 else ''})")
+    while True:
+        answer = input("Month number (Enter cancels): ").strip()
+        if not answer:
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(months):
+            month = months[int(answer) - 1]
+            break
+        print("Please enter one of the listed month numbers.")
+
+    month_transactions = [
+        transaction for transaction in eligible if transaction["date"].startswith(month)
+    ]
+    while True:
+        query = clean_text(input(
+            "Search description, account, category, person, or amount "
+            "(* lists all; Enter cancels): "
+        ))
+        if not query:
+            return None
+        if query == "*":
+            matches = month_transactions
+        else:
+            search = query.casefold()
+            matches = [
+                transaction for transaction in month_transactions
+                if search in " ".join((
+                    transaction.get("description", ""),
+                    transaction.get("identifier", ""),
+                    account_label(transaction),
+                    transaction.get("category", ""),
+                    transaction.get("responsibility", ""),
+                    transaction.get("raw_amount", ""),
+                    " ".join(
+                        str(value)
+                        for split in transaction.get("splits", [])
+                        for value in (
+                            split.get("category", ""),
+                            split.get("responsibility", ""),
+                            split.get("amount", ""),
+                        )
+                    ),
+                )).casefold()
+            ]
+        if not matches:
+            print("No matching transactions. Try another search.")
+            continue
+        if len(matches) > 50 and query != "*":
+            print(f"{len(matches)} transactions matched. Use a more specific search or * to list all.")
+            continue
+        break
+
+    matches = sorted(
+        matches,
+        key=lambda transaction: (
+            transaction["date"], transaction["description"], transaction["id"],
+        ),
+        reverse=True,
+    )
+    print("\nMatching transactions:")
+    for number, transaction in enumerate(matches, 1):
+        amount = abs(money(transaction["raw_amount"]))
+        category = transaction.get("category") or "Uncategorized"
+        person = transaction.get("responsibility") or "No person"
+        if transaction.get("splits"):
+            split_categories = list(dict.fromkeys(
+                split.get("category", "") for split in transaction["splits"]
+                if split.get("category")
+            ))
+            split_people = list(dict.fromkeys(
+                split.get("responsibility", "") for split in transaction["splits"]
+                if split.get("responsibility")
+            ))
+            if split_categories:
+                category = f"Split ({' / '.join(split_categories)})"
+            if split_people:
+                person = " / ".join(split_people)
+        print(
+            f"  {number}. {transaction['date']} | {account_label(transaction)} | "
+            f"{transaction['description']} | {transaction['kind'].replace('_', ' ').title()} | "
+            f"${amount:,.2f} | {category} | {person}"
+        )
+    while True:
+        answer = input("Transaction number (Enter cancels): ").strip()
+        if not answer:
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(matches):
+            return matches[int(answer) - 1]
+        print("Please enter one of the listed transaction numbers.")
+
+
+def prompt_for_saved_transaction_corrections(
+    transactions: list[dict[str, Any]], rules: list[dict[str, str]],
+    decisions: dict[str, Any], save_callback: Callable[[], None] | None = None,
+    categories: list[str] | None = None, people: list[str] | None = None,
+    default_person: str = "", always_ask_categories: set[str] | None = None,
+    category_person_defaults: dict[str, str] | None = None,
+    personless_categories: set[str] | None = None,
+) -> int:
+    categories = categories if categories is not None else CATEGORIES
+    people = people if people is not None else []
+    always_ask_categories = (
+        always_ask_categories if always_ask_categories is not None else {"Bills"}
+    )
+    category_person_defaults = (
+        category_person_defaults if category_person_defaults is not None else {}
+    )
+    personless_categories = (
+        personless_categories if personless_categories is not None else set()
+    )
+    apply_rules_and_decisions(transactions, rules, decisions)
+    corrected = 0
+    while True:
+        transaction = _select_saved_transaction(transactions)
+        if transaction is None:
+            return corrected
+
+        print("\nThis changes only the selected transaction.")
+        if best_matching_rule(transaction, rules):
+            print("A reusable rule also matches it. That rule will remain unchanged.")
+        else:
+            print("Reusable rules will remain unchanged.")
+
+        original_kind = transaction.get("original_kind", transaction["kind"])
+        if original_kind in {"expense", "refund"}:
+            category, choose_person = ask_category(
+                allow_split=original_kind == "expense",
+                categories=categories,
+                save_callback=save_callback,
+                personless_categories=personless_categories,
+            )
+            if category == "__skip__":
+                print("No correction was saved.")
+                return corrected
+            _assign_single_transaction_category(
+                transaction, category, choose_person, decisions, save_callback,
+                categories, people, default_person, always_ask_categories,
+                category_person_defaults, personless_categories,
+            )
+        else:
+            print("  1. Income")
+            print("  2. Estimated reimbursement")
+            while True:
+                answer = input("Money-in type (Enter cancels): ").strip()
+                if not answer:
+                    print("No correction was saved.")
+                    return corrected
+                if answer in {"1", "2"}:
+                    break
+                print("Please enter 1 or 2.")
+            decision = decisions.setdefault(transaction["id"], {})
+            decision.clear()
+            decision["kind_override"] = "income" if answer == "1" else "reimbursement"
+
+        apply_rules_and_decisions([transaction], rules, decisions)
+        if save_callback:
+            save_callback()
+        corrected += 1
+        print("Saved correction. Reusable rules were not changed.")
+        another = input("Review another saved transaction? [y/N]: ").strip().lower()
+        if another not in {"y", "yes"}:
+            return corrected
 
 
 def ask_bill_responsibility(
